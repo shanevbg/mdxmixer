@@ -8,6 +8,14 @@ previous devices (Sonar's engine stays installed and working).
   cables: one per app channel (three to start) plus streaming out plus mic.
   Fewer cables just means fewer app channels at first; the two fixed roles
   always cost two.
+  > The **base VB-CABLE is free** and is a full cable with no limits. The
+  > **A+B** and **C+D** packs are the other four and come with a donation,
+  > so the five-cable layout below is not the free configuration. Two ways
+  > to need fewer: the **streaming out** role disappears if the thing
+  > consuming it is MDropDX12, which takes the mix from shared memory
+  > (`MDXM_FEED`) instead of a device; and the **mic** role is only needed
+  > if voice apps must see a processed microphone. With both of those off
+  > the list, one free cable buys one app channel.
 - [ ] **2. Set every cable to 48 kHz** shared-mode default format:
   `mmsys.cpl` → cable → Properties → Advanced → "24 bit, 48000 Hz" (or
   16/48000) for BOTH the render and capture sides of each cable.
@@ -24,7 +32,7 @@ previous devices (Sonar's engine stays installed and working).
 ## Cable → channel table (fill in during step 3)
 
 | role | cable render endpoint | cable capture endpoint |
-|---|---|---|
+| --- | --- | --- |
 | channel: Game | | |
 | channel: Media | | |
 | channel: Aux | | |

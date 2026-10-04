@@ -154,13 +154,25 @@ a driver that pretends to be a sound card, so whatever an app plays into one
 end, mdxmixer can record out of the other. You install a handful of these once
 and then forget they exist.
 
-[**VB-CABLE**](https://vb-audio.com/Cable/) is what this was built against and
-it is free (donationware). The base download gives you one cable; the **A+B**
-and **C+D** packs on the same page give you four more, which is enough for
-three app channels plus a streaming output and a virtual microphone. Set every
-cable to **24-bit, 48000 Hz** on both its playback and recording sides in
-`mmsys.cpl` — mismatched rates are the one setup mistake that produces
-confusing results.
+[**VB-CABLE**](https://vb-audio.com/Cable/) is what this was built against.
+The base cable is **free** — *"VB-CABLE is a Donationware! All participations
+are welcome"* — and that gets you exactly **one** cable. The **A+B** and
+**C+D** packs are four more, and those come with a donation: *"Click on Donate
+button below to get your personal download link!"*
+
+One cable is further than it sounds, because it only has to carry the thing
+that genuinely needs a device:
+
+- **One app channel**, and everything else stays on your normal output.
+- **Or** a streaming output for a recorder.
+- **And the visualiser needs no cable at all** — `MDXM_FEED` hands the
+  streaming mix to MDropDX12 through shared memory, so if that is where your
+  second fader was going, the free cable is free to be used for something
+  else.
+
+Set every cable to **24-bit, 48000 Hz** on both its playback and recording
+sides in `mmsys.cpl` — mismatched rates are the one setup mistake that
+produces confusing results.
 
 That indirection is the whole trick. A cable never disconnects, never
 re-enumerates and never changes its id. So when the headset drops, exactly one
@@ -274,7 +286,7 @@ in.
 
 | | | |
 | --- | --- | --- |
-| [**VB-CABLE**](https://vb-audio.com/Cable/) | donationware | The virtual cables. Needed for per-app channels; not needed if you only want control over the devices you already have. Take the A+B and C+D packs from the same page for five cables in total. |
+| [**VB-CABLE**](https://vb-audio.com/Cable/) | **base cable free**, extras by donation | The virtual cables. The free one is a full, unlimited cable and is enough for one app channel or one streaming output — not needed at all if you only want control over the devices you already have. The **A+B** and **C+D** packs are four more and come with a donation. |
 | [**SteelSeries Sonar**](https://steelseries.com/gg/sonar) | free | The way to get the two-fader split working **today**, because it keeps both mixes itself and mdxmixer already drives it — see above. This project exists partly because of Sonar's habit of taking the audio graph down with a Bluetooth headset, which is worth knowing before you lean on it. |
 | [**Voicemeeter Potato**](https://vb-audio.com/Voicemeeter/potato.htm) | donationware, dearest of the three | Same people as the cables. Its `GainLayer` is a per-strip, per-bus gain, which is the two-fader model by another name. **Potato specifically** — Voicemeeter, Banana and Potato are three separate products at three prices, and only Potato has it. Not driven by mdxmixer yet, and the better target of the two: a documented C API instead of an undocumented HTTP endpoint. |
 | [**MDropDX12**](https://github.com/shanevbg/MDropDX12) | free | The MilkDrop-style music visualiser this grew up alongside, and the thing most likely to be on the other end of the streaming mix. From **3.3** it reads that mix straight out of the shared-memory ring, so it needs no cable, no recording software and no extra audio device. It also drives this mixer over the pipe rather than touching Windows audio itself. |

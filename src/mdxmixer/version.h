@@ -11,8 +11,8 @@
 // The workflow here reads the three numbers by field, never the string, for
 // exactly that reason. If you add a literal "0.1.0" anywhere below, you are
 // re-creating the trap.
-#define MDXM_VERSION_MAJOR 0
-#define MDXM_VERSION_MINOR 1
+#define MDXM_VERSION_MAJOR 1
+#define MDXM_VERSION_MINOR 0
 #define MDXM_VERSION_PATCH 0
 
 // Two steps: the inner macro has to be expanded before it is stringified,

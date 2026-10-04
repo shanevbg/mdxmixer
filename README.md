@@ -380,6 +380,7 @@ mdxmixer --monitor <in> <out> passthrough: capture, cushion, render at unity
   `"complete": true` marker last, so a half-written file falls back to
   defaults rather than loading half a configuration.
 - **Logs:** `log\mdxmixer.log` beside the exe.
+- **What changed, and when:** [docs/Changes.md](docs/Changes.md).
 - **Design and rationale:**
   [docs/specs/2026-09-22-mdxmixer-design.md](docs/specs/2026-09-22-mdxmixer-design.md).
 

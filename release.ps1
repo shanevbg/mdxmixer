@@ -104,6 +104,7 @@ $payload = @(
     @{ From = Join-Path $root 'CONTRIBUTING.md';       To = 'CONTRIBUTING.md' }
     @{ From = Join-Path $root 'docs\ipc.md';           To = 'docs\ipc.md' }
     @{ From = Join-Path $root 'docs\rollout.md';       To = 'docs\rollout.md' }
+    @{ From = Join-Path $root 'docs\Changes.md';       To = 'docs\Changes.md' }
 )
 
 # The README's pictures, so the shipped copy is not a page of broken image

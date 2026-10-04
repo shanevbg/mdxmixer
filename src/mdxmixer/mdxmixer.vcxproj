@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Test|x64">
+      <Configuration>Test</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{B7E2C4A1-9D3F-4A62-8F1E-2D5C6B9A0E47}</ProjectGuid>
+    <RootNamespace>mdxmixer</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Test|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <OutDir>$(ProjectDir)..\..\bin\Debug\</OutDir>
+    <IntDir>$(ProjectDir)..\..\obj\Debug\</IntDir>
+    <TargetName>mdxmixer</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(ProjectDir)..\..\bin\Release\</OutDir>
+    <IntDir>$(ProjectDir)..\..\obj\Release\</IntDir>
+    <TargetName>mdxmixer</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Test|x64'">
+    <OutDir>$(ProjectDir)..\..\bin\Test\</OutDir>
+    <IntDir>$(ProjectDir)..\..\obj\Test\</IntDir>
+    <TargetName>mdxmixer_test</TargetName>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>_DEBUG;UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\..\tests;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <!-- Sources are UTF-8 without a BOM. Without /utf-8 MSVC reads them in
+           the system ANSI codepage, so a literal like L"— none —" becomes
+           "â€" none â€"" on screen. -->
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- Bind comctl32 6.x. Without this the process gets 5.82: classic-style
+           tabs/trackbars/listviews and every SetWindowTheme("DarkMode_*") call
+           silently does nothing, so the themes are half-applied. -->
+      <AdditionalManifestDependencies>type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'</AdditionalManifestDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\..\tests;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <!-- Sources are UTF-8 without a BOM. Without /utf-8 MSVC reads them in
+           the system ANSI codepage, so a literal like L"— none —" becomes
+           "â€" none â€"" on screen. -->
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- Bind comctl32 6.x. Without this the process gets 5.82: classic-style
+           tabs/trackbars/listviews and every SetWindowTheme("DarkMode_*") call
+           silently does nothing, so the themes are half-applied. -->
+      <AdditionalManifestDependencies>type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'</AdditionalManifestDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Test|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>MDXM_TEST;_DEBUG;UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(ProjectDir)..\..\tests;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <!-- Sources are UTF-8 without a BOM. Without /utf-8 MSVC reads them in
+           the system ANSI codepage, so a literal like L"— none —" becomes
+           "â€" none â€"" on screen. -->
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <!-- Bind comctl32 6.x. Without this the process gets 5.82: classic-style
+           tabs/trackbars/listviews and every SetWindowTheme("DarkMode_*") call
+           silently does nothing, so the themes are half-applied. -->
+      <AdditionalManifestDependencies>type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'</AdditionalManifestDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp" />
+    <ClCompile Include="dsp\biquad.cpp" />
+    <ClCompile Include="config\json_utils.cpp" />
+    <ClCompile Include="config\config.cpp" />
+    <ClCompile Include="ipc\protocol.cpp" />
+    <ClCompile Include="ipc\pipe_server.cpp" />
+    <ClCompile Include="ipc\stream_feed.cpp" />
+    <ClCompile Include="device\endpoints.cpp" />
+    <ClCompile Include="device\device_watcher.cpp" />
+    <ClCompile Include="device\endpoint_volume.cpp" />
+    <ClCompile Include="device\device_identity.cpp" />
+    <ClCompile Include="device\device_info.cpp" />
+    <ClCompile Include="device\device_order.cpp" />
+    <ClCompile Include="engine\capture_stream.cpp" />
+    <ClCompile Include="engine\render_stream.cpp" />
+    <ClCompile Include="engine\failover_watcher.cpp" />
+    <ClCompile Include="engine\engine.cpp" />
+    <ClCompile Include="routing\audio_policy_config.cpp" />
+    <ClCompile Include="routing\sessions.cpp" />
+    <ClCompile Include="routing\reconcile.cpp" />
+    <ClCompile Include="routing\default_endpoint.cpp" />
+    <ClCompile Include="routing\sonar_api.cpp" />
+    <ClCompile Include="routing\sonar_control.cpp" />
+    <ClCompile Include="ui\battery_overlay.cpp" />
+    <ClCompile Include="ui\tab_options.cpp" />
+    <ClCompile Include="ui\tray_icon.cpp" />
+    <ClCompile Include="ui\theme.cpp" />
+    <ClCompile Include="ui\ui_metrics.cpp" />
+    <ClCompile Include="ui\window_capture.cpp" />
+    <ClCompile Include="ui\controls.cpp" />
+    <ClCompile Include="ui\owner_draw.cpp" />
+    <ClCompile Include="ui\tool_window.cpp" />
+    <ClCompile Include="ui\wnd_hotkeys.cpp" />
+    <ClCompile Include="ui\main_window.cpp" />
+    <ClCompile Include="ui\tab_mixer.cpp" />
+    <ClCompile Include="ui\tab_routing.cpp" />
+    <ClCompile Include="ui\tab_eq.cpp" />
+    <ClCompile Include="ui\tab_devices.cpp" />
+    <ClCompile Include="app\thread_guard.cpp" />
+    <ClCompile Include="app\log.cpp" />
+    <ClCompile Include="app\autostart.cpp" />
+    <ClCompile Include="app\format_to.cpp" />
+    <ClCompile Include="app\hotkeys.cpp" />
+    <ClCompile Include="app\channel_setup.cpp" />
+    <ClCompile Include="app\app_controller.cpp" />
+    <ClCompile Include="..\..\tests\test_main.cpp" />
+    <ClCompile Include="..\..\tests\test_ring_buffer.cpp" />
+    <ClCompile Include="..\..\tests\test_gain_ramp.cpp" />
+    <ClCompile Include="..\..\tests\test_biquad.cpp" />
+    <ClCompile Include="..\..\tests\test_limiter.cpp" />
+    <ClCompile Include="..\..\tests\test_resampler.cpp" />
+    <ClCompile Include="..\..\tests\test_config.cpp" />
+    <ClCompile Include="..\..\tests\test_protocol.cpp" />
+    <ClCompile Include="..\..\tests\test_endpoints.cpp" />
+    <ClCompile Include="..\..\tests\test_audio_integration.cpp" />
+    <ClCompile Include="..\..\tests\test_engine_logic.cpp" />
+    <ClCompile Include="..\..\tests\test_pipe.cpp" />
+    <ClCompile Include="..\..\tests\test_theme.cpp" />
+    <ClCompile Include="..\..\tests\test_thread_guard.cpp" />
+    <ClCompile Include="..\..\tests\test_device_identity.cpp" />
+    <ClCompile Include="..\..\tests\test_device_order.cpp" />
+    <ClCompile Include="..\..\tests\test_channel_setup.cpp" />
+    <ClCompile Include="..\..\tests\test_hotkeys.cpp" />
+    <ClCompile Include="..\..\tests\test_reconcile.cpp" />
+    <ClCompile Include="..\..\tests\test_failover_watcher.cpp" />
+    <ClCompile Include="..\..\tests\test_stream_feed.cpp" />
+    <ClCompile Include="..\..\tests\test_sonar_api.cpp" />
+    <ClCompile Include="..\..\tests\test_battery_overlay.cpp" />
+    <ClCompile Include="..\..\tests\test_seen_format.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\tests\test_framework.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="mdxmixer.rc" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

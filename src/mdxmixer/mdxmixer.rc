@@ -1,0 +1,37 @@
+#include <winres.h>
+#include "resource.h"
+#include "version.h"
+
+// Relative to this .rc file, with FORWARD slashes: inside a quoted string
+// rc.exe treats a backslash as an escape, so "..\..\res\..." loses the path
+// separators and reports "file not found: ..\..".
+IDI_MDXMIXER ICON "../../res/mdxmixer.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ // From version.h, so the binary cannot claim one version while the public
+ // snapshot is titled another.
+ FILEVERSION MDXM_VERSION_MAJOR,MDXM_VERSION_MINOR,MDXM_VERSION_PATCH,0
+ PRODUCTVERSION MDXM_VERSION_MAJOR,MDXM_VERSION_MINOR,MDXM_VERSION_PATCH,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "mdxmixer - native Windows audio mixer"
+            VALUE "FileVersion", MDXM_VERSION_STR ".0"
+            VALUE "InternalName", "mdxmixer"
+            VALUE "OriginalFilename", "mdxmixer.exe"
+            VALUE "ProductName", "mdxmixer"
+            VALUE "ProductVersion", MDXM_VERSION_STR ".0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

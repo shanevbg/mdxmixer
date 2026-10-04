@@ -86,6 +86,10 @@ public:
     // MDXM_CAPTURE: write a PNG of the window as it stands. In-process, so
     // owner-drawn content actually paints and the app need not be in front.
     virtual bool CaptureUi(const std::wstring& path, const std::wstring& window) = 0;
+    // MDXM_TAB: bring one tab of the main window to the front, by name.
+    // False for a name that is not a tab. Exists so documentation screenshots
+    // can be regenerated instead of grabbed by hand and left to go stale.
+    virtual bool ShowTab(const std::wstring& name) = 0;
 
     // The Windows volume of each audio endpoint — a separate axis from the
     // channel faders above, and the one a person reaches for when they want

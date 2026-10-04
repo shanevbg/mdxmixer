@@ -42,6 +42,12 @@ public:
 
     void Destroy();
     bool Visible() const { return m_hwnd != nullptr; }
+    // For MDXM_CAPTURE. The overlay is the one surface with no other way to
+    // get a picture of it: it is frameless, click-through and always on top,
+    // so it cannot be focused and a window-picker cannot select it, and the
+    // alternative is a full-desktop grab that would publish whatever else
+    // happens to be on screen.
+    HWND Hwnd() const { return m_hwnd; }
 
     // Where it is and how big, in screen coordinates. Needed to snap it to a
     // RIGHT or BOTTOM corner, where the position depends on its own width.

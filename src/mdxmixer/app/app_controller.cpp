@@ -952,7 +952,9 @@ bool AppController::SetDeviceMute(const std::wstring& endpointId, bool mute) {
 }
 
 bool AppController::CaptureUi(const std::wstring& path, const std::wstring& window) {
-    HWND target = (window == L"hotkeys") ? m_window.HotkeysHwnd() : m_window.Hwnd();
+    HWND target = m_window.Hwnd();
+    if (window == L"hotkeys") target = m_window.HotkeysHwnd();
+    else if (window == L"overlay") target = m_window.OverlayHwnd();
     if (!target) { Log(1, L"capture: no %s window open", window.c_str()); return false; }
     bool ok = CaptureWindowToPng(target, path);
     Log(2, L"capture %s: %s", ok ? L"saved" : L"FAILED", path.c_str());
@@ -961,6 +963,22 @@ bool AppController::CaptureUi(const std::wstring& path, const std::wstring& wind
 
 std::wstring AppController::GetHotkeyStatus(const std::wstring& bindingId) {
     return m_window.HotkeyStatus(bindingId);
+}
+
+// Tab order is the one in MainWindow::Create: Mixer, Routing, EQ, Devices,
+// Options. Matched case-insensitively on the name a person would type rather
+// than on an index, because an index is a thing that silently means something
+// else the day a tab is inserted.
+bool AppController::ShowTab(const std::wstring& name) {
+    std::wstring want;
+    for (wchar_t c : name) want += (wchar_t)towlower(c);
+    static const wchar_t* kTabs[] = { L"mixer", L"routing", L"eq", L"devices", L"options" };
+    for (int i = 0; i < (int)(sizeof kTabs / sizeof kTabs[0]); ++i)
+        if (want == kTabs[i]) {
+            m_window.SelectTab(i);
+            return true;
+        }
+    return false;
 }
 
 bool AppController::ShowHotkeysUi() {

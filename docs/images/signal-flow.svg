@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 430" width="880" height="430" role="img" aria-label="Signal flow: apps render into virtual audio cables, mdxmixer captures those cables as channels, and splits each one into a quiet personal mix going to your headphones and a full-level streaming mix going to a cable your recorder captures. If the headphones drop, failover moves the personal mix to the next device on your list.">
+  <!-- Presentation attributes only, no <style> block: GitHub sanitises SVG and
+       strips some CSS, and a diagram that loses its colours is worse than none. -->
+  <rect x="0" y="0" width="880" height="430" rx="12" fill="#1b2430"/>
+  <rect x="0.5" y="0.5" width="879" height="429" rx="12" fill="none" stroke="#2e3c4e"/>
+
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6b7d91"/>
+    </marker>
+    <marker id="ap" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#58a6ff"/>
+    </marker>
+    <marker id="as" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f0883e"/>
+    </marker>
+  </defs>
+
+  <!-- ── Column 1: your apps ─────────────────────────────────────────── -->
+  <text x="24" y="38" font-family="Segoe UI, system-ui, sans-serif" font-size="12" font-weight="600" fill="#9aa7b4" letter-spacing="0.6">YOUR APPS</text>
+  <rect x="24" y="56"  width="132" height="38" rx="7" fill="#243140" stroke="#33455a"/>
+  <text x="90" y="80" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="14" fill="#e6edf3">Game</text>
+  <rect x="24" y="104" width="132" height="38" rx="7" fill="#243140" stroke="#33455a"/>
+  <text x="90" y="128" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="14" fill="#e6edf3">Browser</text>
+  <rect x="24" y="152" width="132" height="38" rx="7" fill="#243140" stroke="#33455a"/>
+  <text x="90" y="176" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="14" fill="#e6edf3">Chat</text>
+
+  <path d="M 160 75  L 198 75"  stroke="#6b7d91" stroke-width="1.6" fill="none" marker-end="url(#a)"/>
+  <path d="M 160 123 L 198 123" stroke="#6b7d91" stroke-width="1.6" fill="none" marker-end="url(#a)"/>
+  <path d="M 160 171 L 198 171" stroke="#6b7d91" stroke-width="1.6" fill="none" marker-end="url(#a)"/>
+
+  <!-- ── Column 2: the cables ────────────────────────────────────────── -->
+  <text x="204" y="38" font-family="Segoe UI, system-ui, sans-serif" font-size="12" font-weight="600" fill="#9aa7b4" letter-spacing="0.6">VIRTUAL CABLES</text>
+  <rect x="204" y="56"  width="124" height="38" rx="7" fill="#1e2b38" stroke="#3b5068" stroke-dasharray="4 3"/>
+  <text x="266" y="80" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="13" fill="#9fd0ff">CABLE A</text>
+  <rect x="204" y="104" width="124" height="38" rx="7" fill="#1e2b38" stroke="#3b5068" stroke-dasharray="4 3"/>
+  <text x="266" y="128" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="13" fill="#9fd0ff">CABLE B</text>
+  <rect x="204" y="152" width="124" height="38" rx="7" fill="#1e2b38" stroke="#3b5068" stroke-dasharray="4 3"/>
+  <text x="266" y="176" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="13" fill="#9fd0ff">CABLE C</text>
+  <text x="204" y="208" font-family="Segoe UI, system-ui, sans-serif" font-size="11" fill="#6b7d91">one per channel — the app plays</text>
+  <text x="204" y="222" font-family="Segoe UI, system-ui, sans-serif" font-size="11" fill="#6b7d91">in, mdxmixer records out</text>
+
+  <path d="M 332 75  L 370 110" stroke="#6b7d91" stroke-width="1.6" fill="none" marker-end="url(#a)"/>
+  <path d="M 332 123 L 370 123" stroke="#6b7d91" stroke-width="1.6" fill="none" marker-end="url(#a)"/>
+  <path d="M 332 171 L 370 136" stroke="#6b7d91" stroke-width="1.6" fill="none" marker-end="url(#a)"/>
+
+  <!-- ── Column 3: mdxmixer ──────────────────────────────────────────── -->
+  <rect x="376" y="50" width="212" height="152" rx="10" fill="#202c3a" stroke="#415872"/>
+  <text x="482" y="76" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="15" font-weight="600" fill="#e6edf3">mdxmixer</text>
+  <text x="482" y="96" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="11" fill="#9aa7b4">channel · 10-band EQ · two faders</text>
+
+  <circle cx="412" cy="130" r="11" fill="#1f6feb"/>
+  <text x="412" y="135" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="11" font-weight="700" fill="#ffffff">P</text>
+  <rect x="432" y="124" width="136" height="12" rx="6" fill="#2a3744"/>
+  <rect x="432" y="124" width="14" height="12" rx="6" fill="#58a6ff"/>
+
+  <circle cx="412" cy="166" r="11" fill="#bb6016"/>
+  <text x="412" y="171" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="11" font-weight="700" fill="#ffffff">S</text>
+  <rect x="432" y="160" width="136" height="12" rx="6" fill="#2a3744"/>
+  <rect x="432" y="160" width="136" height="12" rx="6" fill="#f0883e"/>
+
+  <path d="M 592 130 L 646 104" stroke="#58a6ff" stroke-width="2" fill="none" marker-end="url(#ap)"/>
+  <path d="M 592 166 L 646 206" stroke="#f0883e" stroke-width="2" fill="none" marker-end="url(#as)"/>
+
+  <!-- ── Column 4: the two destinations ──────────────────────────────── -->
+  <rect x="652" y="68" width="204" height="56" rx="8" fill="#243140" stroke="#1f6feb"/>
+  <text x="668" y="92" font-family="Segoe UI, system-ui, sans-serif" font-size="14" fill="#e6edf3">Your headphones</text>
+  <text x="668" y="111" font-family="Segoe UI, system-ui, sans-serif" font-size="11" fill="#58a6ff">quiet — a few percent</text>
+
+  <rect x="652" y="180" width="204" height="56" rx="8" fill="#243140" stroke="#bb6016"/>
+  <text x="668" y="204" font-family="Segoe UI, system-ui, sans-serif" font-size="14" fill="#e6edf3">Streaming cable → OBS</text>
+  <text x="668" y="223" font-family="Segoe UI, system-ui, sans-serif" font-size="11" fill="#f0883e">full level — what goes out</text>
+
+  <!-- ── The failover story ──────────────────────────────────────────── -->
+  <path d="M 754 128 L 754 290" stroke="#f85149" stroke-width="1.8" fill="none" stroke-dasharray="6 4" marker-end="url(#a)"/>
+  <text x="766" y="166" font-family="Segoe UI, system-ui, sans-serif" font-size="12" font-weight="600" fill="#f85149">drops</text>
+
+  <rect x="608" y="296" width="248" height="94" rx="8" fill="#1e2b38" stroke="#3b5068"/>
+  <text x="624" y="320" font-family="Segoe UI, system-ui, sans-serif" font-size="13" font-weight="600" fill="#e6edf3">Failover list</text>
+  <text x="624" y="341" font-family="Segoe UI, system-ui, sans-serif" font-size="12" fill="#3fb950">1 · Rzr      ← present, takes over</text>
+  <text x="624" y="359" font-family="Segoe UI, system-ui, sans-serif" font-size="12" fill="#6b7d91">2 · XM6</text>
+  <text x="624" y="377" font-family="Segoe UI, system-ui, sans-serif" font-size="12" fill="#6b7d91">3 · Speakers</text>
+
+  <!-- ── The point of the whole picture ──────────────────────────────── -->
+  <rect x="24" y="252" width="552" height="138" rx="8" fill="#1e2b38" stroke="#3b5068"/>
+  <text x="44" y="278" font-family="Segoe UI, system-ui, sans-serif" font-size="13" font-weight="600" fill="#e6edf3">Why the cables are the point</text>
+  <text x="44" y="304" font-family="Segoe UI, system-ui, sans-serif" font-size="12.5" fill="#9aa7b4">Apps never point at the headset. They point at a cable, which never</text>
+  <text x="44" y="324" font-family="Segoe UI, system-ui, sans-serif" font-size="12.5" fill="#9aa7b4">disconnects, never re-enumerates and never changes its id.</text>
+  <text x="44" y="352" font-family="Segoe UI, system-ui, sans-serif" font-size="12.5" fill="#9aa7b4">When the Bluetooth headset drops, exactly one thing has to move —</text>
+  <text x="44" y="372" font-family="Segoe UI, system-ui, sans-serif" font-size="12.5" fill="#9aa7b4">the blue arrow — and nothing upstream of it notices.</text>
+</svg>

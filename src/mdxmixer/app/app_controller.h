@@ -62,6 +62,7 @@ public:
     bool ShowUi() override;
     bool ExitApp() override;
     bool CaptureUi(const std::wstring& path, const std::wstring& window) override;
+    bool ShowTab(const std::wstring& name) override;
     std::vector<DeviceLevel> GetDeviceLevels() override;
     bool SetFeedEnabled(bool on, std::wstring* err) override;
     bool FeedEnabled() override;

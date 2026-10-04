@@ -43,6 +43,14 @@ struct FakeControl : IMixerControl {
     }
     std::wstring captureWindow;
     std::wstring capturePath;
+    bool ShowTab(const std::wstring& name) override {
+        shownTab = name;
+        // The real one matches a name against the tab list; the fake only has
+        // to tell a known name from an unknown one.
+        return name == L"mixer" || name == L"routing" || name == L"eq" ||
+               name == L"devices" || name == L"options";
+    }
+    std::wstring shownTab;
     // The failover rule, so the fake can answer MDXM_FAILOVER and record
     // what a MDXM_FAILOVER_LIST actually set.
     bool feedOn = false;
@@ -428,4 +436,33 @@ MDXM_TEST_CASE(Protocol_FeedRejectsNonsense) {
     auto r = HandleProtocolMessage(L"MDXM_FEED|maybe", f, &sub);
     CHECK(!r.empty() && r[0].rfind(L"MDXM_ERR", 0) == 0);
     CHECK(!f.feedOn);
+}
+
+// MDXM_TAB and the overlay capture target both exist for one reason: the
+// README's screenshots have to be REGENERABLE. A picture nobody can retake is
+// a picture that will be wrong by the next release.
+MDXM_TEST_CASE(Protocol_TabSwitchTakesANameNotAnIndex) {
+    FakeControl f; bool sub = false;
+    auto r = HandleProtocolMessage(L"MDXM_TAB=devices", f, &sub);
+    CHECK(Contains(r, L"MDXM_OK"));
+    CHECK(f.shownTab == L"devices");
+    // An index would silently mean a different tab the day one is inserted.
+    r = HandleProtocolMessage(L"MDXM_TAB=3", f, &sub);
+    CHECK(Contains(r, L"MDXM_ERR"));
+    r = HandleProtocolMessage(L"MDXM_TAB", f, &sub);
+    CHECK(Contains(r, L"MDXM_ERR"));
+}
+
+MDXM_TEST_CASE(Protocol_CaptureTakesTheOverlayAsWellAsTheWindows) {
+    FakeControl f; bool sub = false;
+    for (const wchar_t* w : { L"main", L"hotkeys", L"overlay" }) {
+        auto r = HandleProtocolMessage(std::wstring(L"MDXM_CAPTURE=shot.png|") + w, f, &sub);
+        CHECK(Contains(r, L"MDXM_OK"));
+        CHECK(f.captureWindow == w);
+    }
+    // The overlay is frameless, click-through and always on top, so nothing
+    // else can get a picture of it short of grabbing the whole desktop --
+    // which would publish whatever else was on screen.
+    auto r = HandleProtocolMessage(L"MDXM_CAPTURE=shot.png|desktop", f, &sub);
+    CHECK(Contains(r, L"MDXM_ERR"));
 }

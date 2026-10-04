@@ -20,6 +20,7 @@ public:
     // The Hotkeys window's handle, or null when it is not open. For
     // MDXM_CAPTURE, which has to draw it from inside this process.
     HWND HotkeysHwnd() const;
+    HWND OverlayHwnd() const { return m_battery.Hwnd(); }
     // What the last registration pass got for this binding.
     std::wstring HotkeyStatus(const std::wstring& bindingId) const;
 

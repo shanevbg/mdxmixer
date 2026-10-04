@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 250" width="880" height="250" role="img" aria-label="One channel with two faders: a personal level at 8 percent for what you hear, and a streaming level at 100 percent for what goes out">
+  <!-- Presentation attributes only, no <style> block: GitHub sanitises SVG
+       and strips some CSS, and a diagram that loses its colours is worse than
+       no diagram. The palette is mid-tone on a dark panel so it reads on both
+       the light and the dark GitHub theme. -->
+  <rect x="0" y="0" width="880" height="250" rx="12" fill="#1b2430"/>
+  <rect x="0.5" y="0.5" width="879" height="249" rx="12" fill="none" stroke="#2e3c4e"/>
+
+  <text x="32" y="44" font-family="Segoe UI, system-ui, sans-serif" font-size="19" font-weight="600" fill="#e6edf3">Game</text>
+  <text x="90" y="44" font-family="Segoe UI, system-ui, sans-serif" font-size="14" fill="#9aa7b4">one source, two levels</text>
+
+  <!-- Personal -->
+  <circle cx="42" cy="104" r="13" fill="#1f6feb"/>
+  <text x="42" y="109" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="13" font-weight="700" fill="#ffffff">P</text>
+  <text x="68" y="99" font-family="Segoe UI, system-ui, sans-serif" font-size="14" fill="#e6edf3">Personal</text>
+  <text x="68" y="116" font-family="Segoe UI, system-ui, sans-serif" font-size="12" fill="#9aa7b4">your ears</text>
+
+  <rect x="168" y="94" width="440" height="20" rx="10" fill="#2a3744"/>
+  <rect x="168" y="94" width="35" height="20" rx="10" fill="#58a6ff"/>
+  <text x="624" y="109" font-family="Segoe UI, system-ui, sans-serif" font-size="15" font-weight="600" fill="#58a6ff">8%</text>
+  <text x="680" y="109" font-family="Segoe UI, system-ui, sans-serif" font-size="13" fill="#9aa7b4">what you hear</text>
+
+  <!-- Streaming -->
+  <circle cx="42" cy="174" r="13" fill="#bb6016"/>
+  <text x="42" y="179" text-anchor="middle" font-family="Segoe UI, system-ui, sans-serif" font-size="13" font-weight="700" fill="#ffffff">S</text>
+  <text x="68" y="169" font-family="Segoe UI, system-ui, sans-serif" font-size="14" fill="#e6edf3">Streaming</text>
+  <text x="68" y="186" font-family="Segoe UI, system-ui, sans-serif" font-size="12" fill="#9aa7b4">everyone else</text>
+
+  <rect x="168" y="164" width="440" height="20" rx="10" fill="#2a3744"/>
+  <rect x="168" y="164" width="440" height="20" rx="10" fill="#f0883e"/>
+  <text x="624" y="179" font-family="Segoe UI, system-ui, sans-serif" font-size="15" font-weight="600" fill="#f0883e">100%</text>
+  <text x="680" y="179" font-family="Segoe UI, system-ui, sans-serif" font-size="13" fill="#9aa7b4">what goes out</text>
+
+  <text x="32" y="226" font-family="Segoe UI, system-ui, sans-serif" font-size="13" fill="#9aa7b4">Turn one down and the other does not move. That is the whole idea.</text>
+</svg>

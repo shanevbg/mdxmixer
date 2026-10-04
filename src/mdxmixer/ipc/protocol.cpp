@@ -200,11 +200,28 @@ std::vector<std::wstring> HandleInner(const std::wstring& msg, IMixerControl& ct
 
     if (r.verb == L"MDXM_CAPTURE") {
         if (a.empty() || a.size() > 2 || a[0].empty())
-            return Err(L"MDXM_CAPTURE wants <pngPath> [main|hotkeys]");
+            return Err(L"MDXM_CAPTURE wants <pngPath> [main|hotkeys|overlay]");
         std::wstring which = a.size() == 2 ? a[1] : L"main";
-        if (which != L"main" && which != L"hotkeys")
-            return Err(L"MDXM_CAPTURE window must be main or hotkeys");
+        // `overlay` is the battery readout. It is frameless, click-through and
+        // always on top, so it cannot be focused and no window-picker can
+        // select it -- without this the only way to get a picture of it is a
+        // full-desktop grab, which publishes whatever else is on screen.
+        if (which != L"main" && which != L"hotkeys" && which != L"overlay")
+            return Err(L"MDXM_CAPTURE window must be main, hotkeys or overlay");
         if (!ctl.CaptureUi(a[0], which)) return Err(L"capture failed");
+        return { L"MDXM_OK" };
+    }
+
+    // Switch the main window to a tab, by name.
+    //
+    // It exists so the README's screenshots can be REGENERATED rather than
+    // grabbed by hand once and left to rot as the window changes. Same reason
+    // MDXM_CAPTURE exists at all: a picture nobody can retake is a picture
+    // that will be wrong by the next release.
+    if (r.verb == L"MDXM_TAB") {
+        if (a.size() != 1 || a[0].empty())
+            return Err(L"MDXM_TAB wants <mixer|routing|eq|devices|options>");
+        if (!ctl.ShowTab(a[0])) return Err(L"unknown tab: " + a[0]);
         return { L"MDXM_OK" };
     }
 

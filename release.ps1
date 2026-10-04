@@ -106,6 +106,14 @@ $payload = @(
     @{ From = Join-Path $root 'docs\rollout.md';       To = 'docs\rollout.md' }
 )
 
+# The README's pictures, so the shipped copy is not a page of broken image
+# links. Added by directory rather than named one by one: the screenshots are
+# REGENERATED (MDXM_TAB + MDXM_CAPTURE, see the end of the README), so a hand
+# written list here is a list that goes stale the first time a shot is added.
+foreach ($img in (Get-ChildItem (Join-Path $root 'docs\images') -File -ErrorAction SilentlyContinue)) {
+    $payload += @{ From = $img.FullName; To = "docs\images\$($img.Name)" }
+}
+
 foreach ($item in $payload) {
     if (-not (Test-Path $item.From)) { throw "payload file missing: $($item.From)" }
     $dest = Join-Path $stage $item.To

@@ -66,14 +66,31 @@ mdxmixer.exe --monitor <captureIdOrName> <renderIdOrName>
 
 - Config: `mdxmixer.json` beside the exe — portable, written atomically, a
   `"complete": true` marker written last guards against truncation.
-- IPC: `\\.\pipe\mdxmixer`, UTF-16LE messages, `VERB|field=value|…` grammar;
-  the verb set is in the spec's IPC section.
+- IPC: `\\.\pipe\mdxmixer`, UTF-16LE messages, `VERB|field=value|…` grammar.
+  Every verb, the device and failover records, the identity anchors and the
+  shared-memory audio feed are documented in [docs/ipc.md](docs/ipc.md).
 - Logs: `log/mdxmixer.log` beside the exe, level from config `logLevel`.
+
+## Driving it from another program
+
+MDropDX12 keeps its own mixer window but, when mdxmixer is running, reads and
+writes **through** it rather than calling the Windows audio APIs itself. That
+indirection is the point: two programs both moving endpoints is how a route
+gets flapped between them, and the failover watcher has to be singular.
+
+[docs/ipc.md](docs/ipc.md) is the reference. The short version: connect to the
+pipe, `MDXM_STATE` for everything, `MDXM_SUBSCRIBE|1` to be told when it
+changes, `MDXM_FAILOVER` for the rule and what it currently sees, and
+`MDXM_FEED|1` if you need the audio itself over shared memory — that last one
+is off until asked, because when Sonar is working it already mixes this audio
+and two live sources of it work against each other.
 
 ## License
 
 CC-BY-NC 4.0 — see [LICENSE](LICENSE). Same terms and holder as MDropDX12,
 which is what keeps the parts adapted from it clean.
+[CONTRIBUTING.md](CONTRIBUTING.md) explains the snapshot-publishing shape of
+the public repository.
 
 ## Prerequisite for real use
 

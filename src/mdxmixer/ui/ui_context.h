@@ -21,6 +21,21 @@ struct UiContext {
     std::function<bool()> getAutostart;
     std::function<void()> exitApp;
     std::function<void()> onTick1s;             // app layer: failover tick + config flush
+    // app layer, four times a second, WHETHER OR NOT THE WINDOW IS VISIBLE:
+    // pushes peak levels to subscribed IPC clients. Separate from the 250 ms
+    // page refresh, which is rightly skipped while hidden -- a client watching
+    // for which channel just started blasting is watching precisely when
+    // mdxmixer is in the tray and nobody is looking at its window.
+    std::function<void()> onTick250ms;
+    // The machine is going to sleep / has come back (WM_POWERBROADCAST).
+    //
+    // A top-level window gets these without registering for anything, which is
+    // why they land on the UI layer and are handed down. Nothing in mdxmixer
+    // listened for them at all until a Modern Standby resume left the render
+    // stream wedged on a Bluetooth endpoint that still looked perfectly
+    // healthy -- no audio, and not one log line, for seven hours.
+    std::function<void()> onSuspend;
+    std::function<void()> onResume;
     std::function<void()> onDeviceChangeDebounced;  // app layer: engine OnDeviceSetChanged
     // IPC requests are marshaled onto the UI thread (SendMessage from the pipe
     // client thread), so config + engine control stays single-threaded.

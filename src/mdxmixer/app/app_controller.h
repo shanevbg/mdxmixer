@@ -13,6 +13,7 @@
 #include "ui/main_window.h"
 #include "ui/theme.h"
 #include "ui/ui_context.h"
+#include <map>
 #include <windows.h>
 
 namespace mdxm {
@@ -90,11 +91,17 @@ public:
 
 private:
     void BroadcastState();
+    // MDXM_PEAK to subscribed clients, from the 250 ms tick. Returns at once
+    // when nobody is subscribed; see the definition.
+    void PushPeaks();
     void RestartEngine();
     // Apply every stored app assignment that is not already in force. Control
     // thread only; see the definition.
     void ReconcileRouting(const wchar_t* why);
     std::wstring ExeDir();
+    // Replaces each level's instantaneous peak with a held one. See the
+    // definition; called from GetDeviceLevels and nowhere else.
+    void HoldDevicePeaks(std::vector<DeviceLevel>& levels);
 
     ConfigStore m_store;
     Engine m_engine;
@@ -110,6 +117,49 @@ private:
     UiContext m_uiCtx;
     ThemeState m_theme;
     bool m_firstRun = false;
+
+    // ── Peak metering state ─────────────────────────────────────────────
+    //
+    // The endpoint sweep reads an INSTANTANEOUS peak, four times a second at
+    // best, and a transient between two of those reads is simply not there.
+    // That is useless for the thing the number is for, so the hold lives here,
+    // across sweeps, keyed by endpoint id. Milliseconds are the tick unit on
+    // this side; the mix thread counts frames (dsp/peak_hold.h).
+    //
+    // A map rather than a field on DeviceLevel because DeviceLevel is rebuilt
+    // from scratch by every sweep: there is nowhere in it for a value to
+    // survive. Entries for endpoints that stop appearing are dropped, so an
+    // unplugged headset does not keep a peak alive for the session.
+    struct DevicePeak { PeakHold hold; unsigned lastSweepMs = 0; };
+    std::map<std::wstring, DevicePeak> m_devPeaks;
+    unsigned m_lastSweepMs = 0;
+
+    // Sonar's channel peaks, joined onto its virtual endpoints by the last
+    // sweep. Cached rather than looked up on demand because GetChannels must
+    // not run a COM sweep of its own -- MDXM_STATE asks for channels and for
+    // device levels in the same reply, and enumerating all twenty-eight
+    // endpoints twice to answer one request is a cost with nothing to show for
+    // it. Stale entries expire: see the use site.
+    std::map<std::wstring, float> m_sonarPeaks;
+    unsigned m_sonarPeaksMs = 0;
+
+    // The last swept list, kept so the 250 ms peak push does not have to run a
+    // sweep of its own when the mixer tab has just run one.
+    //
+    // Without it, a subscribed client and a visible window together mean EIGHT
+    // sweeps a second rather than four, each activating COM on every endpoint
+    // — and that path is the one that faulted inside AudioSes.dll while
+    // Bluetooth headsets came and went (see ListEndpointVolumes). It is
+    // guarded, but doubling the rate of the one call known to fault, to
+    // produce a list that already exists, is not a trade worth making.
+    std::vector<DeviceLevel> m_lastLevels;
+
+    // Is MixPull still being called? See Engine::MixFrames. Watched for
+    // MOVEMENT rather than compared against a clock the audio thread sets,
+    // because the audio thread must not call a clock.
+    uint64_t m_lastMixFrames = 0;
+    unsigned m_mixMovedMs = 0;
+    bool m_mixSeen = false;
 };
 
 } // namespace mdxm

@@ -11,7 +11,13 @@ struct FakeControl : IMixerControl {
     std::wstring assignedExe, assignedCh, route;
     bool showCalled = false;
     std::vector<ChannelState> GetChannels() override {
-        return {{L"game", L"Game", true, 0.85f, false, 1.0f, false, true}};
+        // Two channels, so both halves of the peak contract are on the wire:
+        // `game` is metered, `dead` cannot be and must say -1 rather than 0.
+        ChannelState game{L"game", L"Game", true, 0.85f, false, 1.0f, false, true};
+        game.peak = 0.42f;
+        ChannelState dead{L"dead", L"Dead", false, 1.0f, false, 1.0f, false, false};
+        dead.peak = kPeakUnknown;
+        return { game, dead };
     }
     std::vector<std::pair<std::wstring, std::wstring>> GetRoutes() override {
         return {{L"personal", L"{hp-guid}"}};
@@ -56,11 +62,19 @@ struct FakeControl : IMixerControl {
     }
 
     std::vector<DeviceLevel> GetDeviceLevels() override {
+        ++deviceLevelCalls;
         DeviceLevel d;
         d.id = L"{hp-guid}"; d.name = L"Headphones"; d.isRender = true;
         d.isDefault = true; d.vol = 0.42f; d.mute = false;
-        return { d };
+        d.peak = 0.1f;
+        // An endpoint with no meter to read: paired, switched off, no stream.
+        DeviceLevel off;
+        off.id = L"{off-guid}"; off.name = L"Headphones (11- WF-1000XM5)";
+        off.isRender = true; off.active = false; off.volumeKnown = false;
+        off.peak = kPeakUnknown;
+        return { d, off };
     }
+    int deviceLevelCalls = 0;
     bool SetDeviceVolume(const std::wstring& id, float v) override {
         devVolId = id; devVol = v; return id == L"{hp-guid}";
     }
@@ -116,9 +130,64 @@ MDXM_TEST_CASE(Protocol_StateIsChunkedAndTerminated) {
     auto r = HandleProtocolMessage(L"MDXM_STATE", f, &sub);
     CHECK(r.front() == L"MDXM_BEGIN");
     CHECK(r.back() == L"MDXM_END");                       // the MDropDX12 chunking contract
-    CHECK(Contains(r, L"MDXM_CHAN|id=game|name=Game|health=ok|pvol=0.85|pmute=0|svol=1|smute=0|eq=1"));
+    CHECK(Contains(r, L"MDXM_CHAN|id=game|name=Game|health=ok|pvol=0.85|pmute=0|svol=1|smute=0|eq=1|peak=0.42"));
     CHECK(Contains(r, L"MDXM_ROUTE|id=personal|device={hp-guid}"));
     CHECK(Contains(r, L"MDXM_DEV|id={hp-guid}"));
+}
+
+// -1 and 0 are different answers, and the wire has to carry the difference.
+// A client sorting a channel list by what is making sound must be able to tell
+// "this channel is quiet" from "nobody can say", and `%g` on -1.0f has to come
+// out as the literal -1 that docs/ipc.md promises.
+MDXM_TEST_CASE(Protocol_PeakUnknownIsMinusOneNotZero) {
+    FakeControl f; bool sub = false;
+    auto r = HandleProtocolMessage(L"MDXM_STATE", f, &sub);
+    CHECK(Contains(r, L"MDXM_CHAN|id=dead|name=Dead|health=bad|pvol=1|pmute=0|svol=1|smute=0|eq=0|peak=-1"));
+    for (const auto& line : r) {
+        if (line.rfind(L"MDXM_DEVLVL|id={hp-guid}", 0) == 0)
+            CHECK(line.find(L"|peak=0.1") != std::wstring::npos);
+        if (line.rfind(L"MDXM_DEVLVL|id={off-guid}", 0) == 0)
+            CHECK(line.find(L"|peak=-1") != std::wstring::npos);
+    }
+}
+
+// The device sweep is what feeds the peak hold and what the Sonar peaks are
+// joined off, so MDXM_STATE has to ask for it before it asks for channels --
+// otherwise the first reply on a fresh connection reports every Sonar channel
+// as unmetered. Once, though: enumerating twenty-eight endpoints twice to
+// answer one request is a cost with nothing to show for it.
+MDXM_TEST_CASE(Protocol_StateSweepsDevicesExactlyOnce) {
+    FakeControl f; bool sub = false;
+    HandleProtocolMessage(L"MDXM_STATE", f, &sub);
+    CHECK(f.deviceLevelCalls == 1);
+}
+
+// MDXM_PEAK is ONE message carrying every row, pushed four times a second.
+// Thirty-odd rows as thirty-odd messages would be a hundred and forty messages
+// a second to say what fits in one, and a client would have to wait to find
+// out whether it had the whole picture.
+MDXM_TEST_CASE(Protocol_PeakRecordIsOneCompleteMessage) {
+    FakeControl f;
+    const auto rec = PeakRecord(f.GetChannels(), f.GetDeviceLevels());
+    CHECK(rec.rfind(L"MDXM_PEAK|", 0) == 0);
+    // Both channels and both endpoints, each as <id>~<peak>.
+    CHECK(rec.find(L"|chan=game~0.42") != std::wstring::npos);
+    CHECK(rec.find(L"|chan=dead~-1") != std::wstring::npos);
+    CHECK(rec.find(L"|dev={hp-guid}~0.1") != std::wstring::npos);
+    CHECK(rec.find(L"|dev={off-guid}~-1") != std::wstring::npos);
+    // One message, so exactly one verb in it.
+    CHECK(rec.find(L"MDXM_PEAK", 1) == std::wstring::npos);
+}
+
+// The pushed MDXM_CHAN and the polled one are the SAME record, because they are
+// the same function. They used to be two pieces of formatting -- protocol.cpp
+// built one and app_controller.cpp hand-wrote the other with swprintf -- which
+// is how a field could reach clients that poll and not clients that listen.
+MDXM_TEST_CASE(Protocol_ChannelRecordIsTheOneFormatter) {
+    FakeControl f; bool sub = false;
+    const auto r = HandleProtocolMessage(L"MDXM_STATE", f, &sub);
+    for (const auto& c : f.GetChannels())
+        CHECK(Contains(r, ChannelRecord(c)));
 }
 
 MDXM_TEST_CASE(Protocol_SetVolumeParsesAndDispatches) {

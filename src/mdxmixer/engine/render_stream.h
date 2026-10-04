@@ -19,6 +19,19 @@ public:
     void Stop();
     uint32_t DeviceRate() const { return m_rate; }
     bool Invalidated() const;   // AUDCLNT_E_DEVICE_INVALIDATED seen; thread has exited
+    // The render event stopped being signalled for a second while nothing
+    // returned an error. Thread has exited, device released.
+    //
+    // A SEPARATE condition from Invalidated(), because a stalled stream never
+    // sets that flag and this is the state a Bluetooth endpoint reaches across
+    // a Modern Standby resume: still listed, still DEVICE_STATE_ACTIVE, still
+    // answering its volume and its meter, no longer clocking. Before this
+    // existed the wait was INFINITE and nothing in the program could see it;
+    // see the measurements at the wait itself.
+    bool Stalled() const;
+    // Either way of being dead. What a caller deciding whether to restart
+    // actually wants to ask -- the distinction above is for the log.
+    bool Dead() const { return Invalidated() || Stalled(); }
 
 private:
     struct Impl;

@@ -199,6 +199,7 @@
     <ClCompile Include="..\..\tests\test_sonar_api.cpp" />
     <ClCompile Include="..\..\tests\test_battery_overlay.cpp" />
     <ClCompile Include="..\..\tests\test_seen_format.cpp" />
+    <ClCompile Include="..\..\tests\test_peak_hold.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\tests\test_framework.h" />

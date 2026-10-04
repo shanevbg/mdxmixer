@@ -39,20 +39,38 @@ bool ParseBool01(const std::wstring& s, bool* out) {
     return false;
 }
 
-std::wstring ChanRecord(const ChannelState& c) {
+} // namespace
+
+std::wstring ChannelRecord(const ChannelState& c) {
     return L"MDXM_CHAN|id=" + c.id + L"|name=" + c.name +
            L"|health=" + (c.healthy ? L"ok" : L"bad") +
            L"|pvol=" + FmtNum(c.pvol) + L"|pmute=" + (c.pmute ? L"1" : L"0") +
            L"|svol=" + FmtNum(c.svol) + L"|smute=" + (c.smute ? L"1" : L"0") +
-           L"|eq=" + (c.eqOn ? L"1" : L"0");
+           L"|eq=" + (c.eqOn ? L"1" : L"0") +
+           // Appended, never inserted. A field added at the END of an existing
+           // record is invisible to a client that does not know about it,
+           // which is why this is not a new verb: MDropDX12 relays MDXM_CHAN
+           // onto its own MIXER_FADER, and a reader that ignores `peak` keeps
+           // working unchanged.
+           L"|peak=" + FmtNum(c.peak);
 }
+
+std::wstring PeakRecord(const std::vector<ChannelState>& channels,
+                        const std::vector<DeviceLevel>& devices) {
+    std::wstring out = L"MDXM_PEAK";
+    for (const auto& c : channels) out += L"|chan=" + c.id + L"~" + FmtNum(c.peak);
+    for (const auto& d : devices)  out += L"|dev="  + d.id + L"~" + FmtNum(d.peak);
+    return out;
+}
+
+namespace {
 
 // Echo reply after a successful channel mutation: the affected channel's record
 // (writes are optimistic; the subscription push carries the truth — spec).
 std::vector<std::wstring> ChanEcho(IMixerControl& ctl, const std::wstring& id) {
     for (const auto& c : ctl.GetChannels())
-        if (c.id == id) return { ChanRecord(c) };
-    return { ChanRecord({ id, id, true, 1.0f, false, 1.0f, false, false }) };
+        if (c.id == id) return { ChannelRecord(c) };
+    return { ChannelRecord({ id, id, true, 1.0f, false, 1.0f, false, false }) };
 }
 
 std::vector<std::wstring> HandleInner(const std::wstring& msg, IMixerControl& ctl,
@@ -71,7 +89,15 @@ std::vector<std::wstring> HandleInner(const std::wstring& msg, IMixerControl& ct
     if (r.verb == L"MDXM_STATE") {
         std::vector<std::wstring> out;
         out.push_back(L"MDXM_BEGIN");
-        for (const auto& c : ctl.GetChannels()) out.push_back(ChanRecord(c));
+        // Device levels are fetched FIRST and emitted last, which looks
+        // backwards and is deliberate: that sweep is what feeds the peak hold,
+        // and the Sonar channel peaks are joined off its results. Asked in
+        // record order, the very first MDXM_STATE on a fresh connection would
+        // report every Sonar channel's peak as unknown. The order of the
+        // RECORDS in the reply is unchanged, which is the part that is a
+        // contract.
+        const auto levels = ctl.GetDeviceLevels();
+        for (const auto& c : ctl.GetChannels()) out.push_back(ChannelRecord(c));
         for (const auto& rt : ctl.GetRoutes())
             out.push_back(L"MDXM_ROUTE|id=" + rt.first + L"|device=" + rt.second);
         for (const auto& d : ctl.GetDevices())
@@ -87,7 +113,7 @@ std::vector<std::wstring> HandleInner(const std::wstring& msg, IMixerControl& ct
         // "Today 16:07" sorts below "Ystrdy" and both above every real date,
         // and a client in another timezone could not undo the substitution
         // anyway. Rendering it is the client's job.
-        for (const auto& d : ctl.GetDeviceLevels())
+        for (const auto& d : levels)
             out.push_back(L"MDXM_DEVLVL|id=" + d.id + L"|name=" + d.name +
                           L"|alias=" + d.displayName +
                           L"|flow=" + (d.isRender ? L"render" : L"capture") +
@@ -101,7 +127,13 @@ std::vector<std::wstring> HandleInner(const std::wstring& msg, IMixerControl& ct
                           L"|hidden=" + (d.hidden ? L"1" : L"0") +
                           L"|pinned=" + (d.pinned ? L"1" : L"0") +
                           L"|container=" + d.containerId +
-                          L"|bt=" + d.btAddress);
+                          L"|bt=" + d.btAddress +
+                          // What is FLOWING on the endpoint, as against `vol`,
+                          // which is where its slider sits. -1 means the meter
+                          // could not be read and is a different answer from
+                          // 0, exactly as `battery` above. Appended last, for
+                          // the reason ChannelRecord gives.
+                          L"|peak=" + FmtNum(d.peak));
         out.push_back(L"MDXM_END");
         return out;
     }

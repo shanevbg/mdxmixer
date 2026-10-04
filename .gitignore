@@ -4,3 +4,7 @@ obj/
 .vs/
 log/
 mdxmixer.json
+
+# Release artifacts: built by release.ps1, published to GitHub Releases.
+# Nothing here is a source input.
+/dist/

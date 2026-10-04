@@ -9,6 +9,7 @@
 //
 // Control thread only. Every call activates COM interfaces, so none of this may
 // run on an audio thread or inside a device notification (MDropDX12 fj#401).
+#include "dsp/peak_hold.h"   // kPeakUnknown — no Windows types, see mixer_control.h
 #include <string>
 #include <vector>
 
@@ -62,14 +63,22 @@ struct DeviceLevel {
     // the names even though the actual id of the device is the same".
     std::wstring btAddress;
     bool isHandsFree = false;     // the mono narrowband twin of a headset
-    // The level Windows is PUTTING on this endpoint right now, 0..1.
+    // The level Windows is PUTTING on this endpoint right now, 0..1, or
+    // kPeakUnknown (-1) when it cannot be read.
     //
     // Not the volume setting -- what is actually flowing. It is the one
     // reading that separates "nothing is being sent here" from "something is
     // being sent and you cannot hear it", which on 2026-10-03 was the
     // difference between a broken mixer and a flapping Bluetooth link, and
     // nothing on the machine showed it.
-    float peak = 0.0f;
+    //
+    // -1 AND 0.0 ARE DIFFERENT ANSWERS, and the difference is the point.
+    // An endpoint Windows has parked as UNPLUGGED has no meter to activate,
+    // and one whose IAudioMeterInformation refuses has none either; both must
+    // say "cannot know" rather than "silent", because silent is a claim and a
+    // client sorting by what is making sound would rank them as confidently
+    // quiet. Same rule this struct already applies to `battery`.
+    float peak = kPeakUnknown;
     // How the user filed it: see DeviceView in device_identity.h. Filled in by
     // the controller from the saved list, not read from Windows.
     bool hidden = false;

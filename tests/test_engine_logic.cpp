@@ -54,3 +54,56 @@ MDXM_TEST_CASE(Personal_FallbackRefusesToFeedItsOwnSource) {
     CHECK(PickPersonalOutput(eps, {L"{speakers}", L"Speakers"}, L"{sonar-gaming}", avoid)
           == L"{speakers}");
 }
+
+// ── The render watchdog's decision ───────────────────────────────────────
+//
+// The bug these exist for, in full, because it took a morning of silence to
+// find and nothing in the program could see it:
+//
+// Coming out of Modern Standby on 2026-10-04 the Bluetooth headset's endpoint
+// stayed listed, stayed DEVICE_STATE_ACTIVE, and went on answering its volume
+// and its battery -- while its WASAPI render event simply stopped being
+// signalled. render_stream.cpp waited INFINITE on that event, so no call ever
+// returned an error, `invalidated` was never set, and all four places in
+// engine.cpp that asked Invalidated() were blind by construction. MDXM_DIAG at
+// the time:
+//
+//     MDXM_RING|id=sonar|depth=96000|drops=57654426|underruns=0
+//
+// The ring at its full capacity, 57.6 million frames dropped, and underruns=0
+// -- the mix thread never once ran to find the ring empty, because MixPull is
+// driven by the render callback. The capture end was a Sonar virtual endpoint
+// which survived the resume and went on filling a ring nothing drained.
+//
+// So the watchdog's question is not "did anything report an error" but "are
+// frames moving", and these cover the two ways that question is NOT enough on
+// its own.
+
+MDXM_TEST_CASE(Watchdog_RestartsOnlyWhenFramesStopWithARenderUp) {
+    // The fault: a render is up, frames are not moving, and it has been long
+    // enough that this is not a scheduling hiccup.
+    CHECK(WatchdogShouldRestart(false, true, kWatchdogStuckMs));
+    CHECK(WatchdogShouldRestart(false, true, kWatchdogStuckMs * 10));
+}
+
+MDXM_TEST_CASE(Watchdog_LeavesAWorkingStreamAlone) {
+    // Frames moving is the whole answer, however long the last gap was.
+    CHECK(!WatchdogShouldRestart(true, true, 0));
+    CHECK(!WatchdogShouldRestart(true, true, kWatchdogStuckMs * 100));
+}
+
+MDXM_TEST_CASE(Watchdog_DoesNotRestartWhatIsNotRunning) {
+    // No output device at all is a legitimate state: every headset switched
+    // off and nothing else to play to. Frames are not moving and must not be
+    // expected to. Restarting here would be a Start() against no endpoint,
+    // once a second, forever.
+    CHECK(!WatchdogShouldRestart(false, false, kWatchdogStuckMs * 10));
+}
+
+MDXM_TEST_CASE(Watchdog_WaitsOutABriefStall) {
+    // A graph rebuild holds m_mutex, so the watchdog blocks on it rather than
+    // racing it -- but a tick that lands either side of a Stop()/Start() pair
+    // still sees no movement. Below the threshold it keeps its hands off.
+    CHECK(!WatchdogShouldRestart(false, true, 0));
+    CHECK(!WatchdogShouldRestart(false, true, kWatchdogStuckMs - 1));
+}

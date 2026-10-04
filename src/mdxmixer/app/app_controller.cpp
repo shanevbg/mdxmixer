@@ -63,6 +63,11 @@ bool AppController::Start(HINSTANCE hInstance) {
     m_uiCtx.getAutostart = [] { return mdxm::GetAutostart(); };
     m_uiCtx.exitApp = [] { PostQuitMessage(0); };
     m_uiCtx.onTick1s = [this] {
+        // BEFORE the failover tick. The watchdog can restart a wedged render
+        // on the device we are already bound to, which is the cheap repair;
+        // letting failover look first would have it re-home to a different
+        // headset for a fault that one restart fixes.
+        m_engine.TickWatchdog();
         m_engine.TickFailover();
         m_store.FlushIfDue();
         // Sonar's levels move from Sonar's own window too, so they are polled
@@ -78,6 +83,28 @@ bool AppController::Start(HINSTANCE hInstance) {
             Log(2, L"sonar channels: %s", m_sonar.Available() ? L"available" : L"gone");
             m_window.RebuildPages();
         }
+    };
+    m_uiCtx.onTick250ms = [this] { PushPeaks(); };
+    m_uiCtx.onSuspend = [this] { m_engine.OnSuspend(); };
+    m_uiCtx.onResume = [this] {
+        m_engine.OnResume();
+        // Sonar comes back from a resume in its own time, and sometimes not at
+        // all -- the same bug on their side, as Shane put it. Forcing the
+        // refresh rather than waiting for the 1 Hz poll means its rows and
+        // levels are right as soon as it answers, and the rebuild below takes
+        // its faders away if it does not.
+        const bool had = m_sonar.Available();
+        m_sonar.Refresh(true);
+        if (m_sonar.Available() != had) {
+            Log(2, L"sonar channels after resume: %s",
+                m_sonar.Available() ? L"available" : L"gone");
+            m_window.RebuildPages();
+        }
+        // An app routed to a cable can come back pointing somewhere else: the
+        // channel recovers by name, its apps do not (fj#1). Same reason the
+        // device-change path does this.
+        ReconcileRouting(L"resumed from suspend");
+        BroadcastState();
     };
     m_uiCtx.onDeviceChangeDebounced = [this] {
         m_engine.OnDeviceSetChanged();
@@ -161,19 +188,80 @@ void AppController::RestartEngine() {
 }
 
 void AppController::BroadcastState() {
-    for (const auto& c : m_engine.GetChannelStates()) {
-        wchar_t buf[512];
-        swprintf(buf, 512, L"MDXM_CHAN|id=%s|name=%s|health=%s|pvol=%g|pmute=%d|svol=%g|smute=%d|eq=%d",
-                 c.id.c_str(), c.name.c_str(), c.healthy ? L"ok" : L"bad",
-                 (double)c.pvol, c.pmute ? 1 : 0, (double)c.svol, c.smute ? 1 : 0, c.eqOn ? 1 : 0);
-        m_pipe.Broadcast(buf);
-    }
+    // GetChannels(), not m_engine.GetChannelStates(), and ChannelRecord(), not
+    // a swprintf of the same fields. Both were wrong in the same quiet way.
+    //
+    // The engine's list has no Sonar rows, so a subscriber was never pushed a
+    // Sonar channel at all -- it saw six faders appear on an MDXM_STATE poll
+    // and then never move again, while a client that only subscribed saw them
+    // not at all. And the record was formatted HERE as well as in protocol.cpp,
+    // so `peak` would have reached clients that poll and not clients that
+    // listen: two spellings of one record is a bug with a delay fuse.
+    for (const auto& c : GetChannels()) m_pipe.Broadcast(ChannelRecord(c));
     DiagState d = m_engine.GetDiag();
     m_pipe.Broadcast(L"MDXM_ROUTE|id=personal|device=" + d.personalDevice);
 }
 
+// Peak levels to anyone listening, four times a second.
+//
+// A SEPARATE PUSH from BroadcastState, because the two answer different
+// questions and move at different speeds. BroadcastState fires when something
+// was changed -- a fader moved, a route switched -- and a subscriber reads it
+// as "state changed". Peaks change constantly and change nothing; folding them
+// into MDXM_CHAN would make every client re-read every fader position it
+// already knows, four times a second, and leave it unable to tell a push that
+// means "someone moved a fader" from one that means "the music got louder".
+//
+// NOTHING HAPPENS WHEN NOBODY IS LISTENING, and the test is made before the
+// work rather than inside Broadcast: this runs forever, and the endpoint sweep
+// it needs activates COM on every endpoint. That is the cost the issue was
+// worried about, and it is paid only while a client has actually asked.
+//
+// This is also why it is a pushed record and not something a client polls.
+// MDXM_STATE is a full state block; polling one four times a second to watch a
+// number move is exactly what section 7 of docs/ipc.md says not to do.
+void AppController::PushPeaks() {
+    if (!m_pipe.HasSubscribers()) return;
+    // Half a tick's grace. The mixer tab's own 250 ms refresh runs on the same
+    // timer message as this does, so when the window is visible one of the two
+    // has almost always just swept; sweeping again would double the rate of the
+    // one call known to fault inside AudioSes.dll to rebuild a list that is
+    // already in hand. When nothing has swept recently -- mdxmixer in the tray,
+    // which is the normal case for a subscribed client -- this is the sweep.
+    const unsigned now = (unsigned)GetTickCount();
+    const bool fresh = m_lastSweepMs != 0 && (now - m_lastSweepMs) < 125 &&
+                       !m_lastLevels.empty();
+    const auto& levels = fresh ? m_lastLevels : (m_lastLevels = GetDeviceLevels());
+    m_pipe.Broadcast(PeakRecord(GetChannels(), levels));
+}
+
 std::vector<ChannelState> AppController::GetChannels() {
     auto out = m_engine.GetChannelStates();
+
+    // Is the mix actually running?
+    //
+    // The engine's peak-holds are fed by MixPull, which is driven by the
+    // personal render callback -- so with no render device at all MixPull stops
+    // being called and every held peak freezes at whatever was playing when the
+    // device went away. Frozen and presented as current, it points at the wrong
+    // row, which is worse than saying nothing.
+    //
+    // Watched for MOVEMENT against this thread's clock rather than a timestamp
+    // the audio thread writes, because the audio thread must not call a clock
+    // (dsp/peak_hold.h). Two sweeps' grace at the UI's 250 ms tick: enough that
+    // an ordinary scheduling hiccup does not blank the meters.
+    {
+        const unsigned now = (unsigned)GetTickCount();
+        const uint64_t frames = m_engine.MixFrames();
+        if (!m_mixSeen || frames != m_lastMixFrames) {
+            m_lastMixFrames = frames;
+            m_mixMovedMs = now;
+            m_mixSeen = true;
+        }
+        if ((now - m_mixMovedMs) > 600)
+            for (auto& c : out) c.peak = kPeakUnknown;
+    }
+
     // Sonar's channels alongside our own, each carrying the same two levels.
     //
     // This is the thing Shane could do in mdx12 and not here: "we gave up
@@ -186,6 +274,14 @@ std::vector<ChannelState> AppController::GetChannels() {
     // Appended rather than merged: these are not engine channels, nothing
     // about them is persisted in mdxmixer.json, and their levels live in
     // Sonar. The "sonar:" prefix on the id is what routes a write back here.
+    //
+    // The peak comes from the last endpoint sweep rather than a fresh one, and
+    // only while that sweep is recent enough for the value to still be inside
+    // its own hold window: past kPeakHoldMs the reading has expired by its own
+    // rules, and reporting it would be the frozen-meter problem again with a
+    // different cause.
+    const bool sonarPeaksFresh =
+        m_sonarPeaksMs != 0 && ((unsigned)GetTickCount() - m_sonarPeaksMs) <= kPeakHoldMs;
     for (const auto& c : m_sonar.Channels()) {
         ChannelState s;
         s.id = L"sonar:" + c.key;
@@ -196,6 +292,11 @@ std::vector<ChannelState> AppController::GetChannels() {
         s.svol = c.streamingVol;
         s.smute = c.streamingMute;
         s.eqOn = false;
+        s.peak = kPeakUnknown;
+        if (sonarPeaksFresh) {
+            auto it = m_sonarPeaks.find(c.key);
+            if (it != m_sonarPeaks.end()) s.peak = it->second;
+        }
         out.push_back(s);
     }
     return out;
@@ -538,8 +639,66 @@ std::vector<DeviceLevel> AppController::GetDeviceLevels() {
     // was asked for. Failover can have moved us somewhere else since, and the
     // row worth hoisting is the one actually carrying the audio.
     ApplyDeviceView(m_store.Get(), levels, m_engine.GetDiag().personalDevice);
+    HoldDevicePeaks(levels);
     return levels;
 }
+
+// Turn each sweep's instantaneous reading into a peak that stays up for
+// kPeakHoldMs.
+//
+// Called from GetDeviceLevels, which is every path that produces endpoint
+// peaks: the mixer tab's 250 ms timer, MDXM_STATE, and the subscription push.
+// Whichever of those is running keeps the hold fed, and the elapsed time is
+// measured rather than assumed, so a 250 ms tick and a one-off request a
+// minute apart both decay correctly.
+//
+// GetTickCount rather than GetTickCount64 to match the rest of this file; the
+// 49-day wrap is handled by the unsigned subtraction, which is correct across
+// it.
+void AppController::HoldDevicePeaks(std::vector<DeviceLevel>& levels) {
+    const unsigned now = (unsigned)GetTickCount();
+    const unsigned elapsed = m_lastSweepMs ? (now - m_lastSweepMs) : 0;
+    m_lastSweepMs = now;
+
+    for (auto& d : levels) {
+        if (d.id.empty()) continue;
+        DevicePeak& e = m_devPeaks[d.id];
+        e.hold.Configure(kPeakHoldMs);
+        e.lastSweepMs = now;
+        if (d.peak < 0.0f) {
+            // The sweep could not read a meter on this endpoint -- unplugged,
+            // or IAudioMeterInformation refused. Forget the held value instead
+            // of holding it: a peak from before a headset switched off,
+            // presented as current, points at a device that is not there.
+            e.hold.MarkUnknown();
+        } else {
+            e.hold.Push(d.peak, elapsed);
+        }
+        d.peak = e.hold.Value();
+    }
+
+    // Endpoints that have stopped appearing in the sweep. Dropped rather than
+    // kept, so the map does not grow for the life of the process on a machine
+    // that re-pairs headsets daily and mints a new endpoint id each time.
+    for (auto it = m_devPeaks.begin(); it != m_devPeaks.end(); ) {
+        if (it->second.lastSweepMs != now) it = m_devPeaks.erase(it);
+        else ++it;
+    }
+
+    // While the whole list with its names and its held peaks is in hand, do
+    // the Sonar join. GetChannels reads the result; see m_sonarPeaks.
+    m_sonarPeaks.clear();
+    for (const wchar_t* key : { L"aux", L"media", L"game",
+                                L"chatRender", L"chatCapture" })
+        m_sonarPeaks[key] = SonarChannelPeak(levels, key);
+    m_sonarPeaksMs = now;
+
+    m_lastLevels = levels;
+}
+
+// SonarChannelPeak, which does the join, lives in routing/sonar_api.cpp beside
+// SonarWritePath — it is pure, it is about Sonar's vocabulary rather than this
+// controller's, and it needs testing without a live GG.
 
 // ── Failover ─────────────────────────────────────────────────────────────
 //

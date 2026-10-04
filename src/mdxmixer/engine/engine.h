@@ -14,6 +14,7 @@
 #include "dsp/biquad.h"
 #include "dsp/gain_ramp.h"
 #include "dsp/limiter.h"
+#include "dsp/peak_hold.h"
 #include "dsp/resampler.h"
 #include "dsp/ring_buffer.h"
 #include "ipc/stream_feed.h"
@@ -40,6 +41,27 @@ std::wstring PickPersonalOutput(const std::vector<EndpointInfo>& eps,
                                 const std::wstring& systemDefaultId,
                                 const std::vector<std::wstring>& avoid = {});
 
+// How long the mix may go un-pulled before the render is presumed wedged.
+//
+// Three of the 1 s control ticks. The render device period is about 10 ms, so
+// a live stream advances the frame count roughly a hundred times a second;
+// three seconds of no movement is not a busy machine, it is a dead stream.
+// Long enough that a graph rebuild (which holds m_mutex, so the watchdog waits
+// on it rather than racing it) cannot be mistaken for one.
+constexpr unsigned kWatchdogStuckMs = 3000;
+
+// Should TickWatchdog restart the personal render?
+//
+// Pure, and separate from the tick, because the interesting part is the
+// three-way condition and not the plumbing: "frames are not moving" alone is
+// true of a machine with no output device at all, and of the moment between
+// Stop() and Start().
+//
+//   framesMoved  the mix frame count changed since the last tick
+//   haveRender   a personal render is SUPPOSED to be running right now
+//   stuckMs      how long since the count last moved
+bool WatchdogShouldRestart(bool framesMoved, bool haveRender, unsigned stuckMs);
+
 struct ChannelRuntime {
     std::wstring id, name;
     std::atomic<bool> healthy{false};   // cable found and capture running
@@ -60,6 +82,17 @@ struct ChannelRuntime {
     CaptureStream capture;
     bool cushionDone = false;           // mix thread only
     DeviceRef captureBinding;
+    // What this channel's source is carrying, for anything that wants to find
+    // the row making a noise. Measured on the mix thread off the channel's own
+    // samples, before the two gains -- see ChannelState::peak for why before.
+    //
+    // `peakHold` is mix-thread-only state; `peakPub` is the one value a reader
+    // on any thread may touch. A relaxed atomic float because a reader wants
+    // the latest value and never a sequence of them: a torn read is impossible
+    // for a 4-byte aligned load, and being one block stale is invisible at
+    // 10 ms blocks.
+    PeakHold peakHold;
+    std::atomic<float> peakPub{ kPeakUnknown };
 };
 
 class Engine {
@@ -103,6 +136,19 @@ public:
     bool EnableEq(const std::wstring& ch, bool on);
     bool SetPersonalOutput(const std::wstring& endpointId);  // stops+restarts the personal render
     void TickFailover();         // control thread, ~1 s: drives the FailoverWatcher
+    // Control thread, ~1 s. Is the mix actually being pulled? Restarts the
+    // personal render when it is not. See the definition for why this exists
+    // on top of RenderStream::Dead() and the device notifications.
+    void TickWatchdog();
+    // The machine is going to sleep / has come back. Control thread.
+    //
+    // A resume is not a device change and does not arrive as one: across a
+    // Modern Standby resume on 2026-10-04 the Bluetooth endpoint stayed
+    // listed, stayed active, and kept answering its volume, while its render
+    // event stopped firing for good. Nothing in the program could see that,
+    // so there was no audio and no log line for seven hours.
+    void OnSuspend();
+    void OnResume();
 
     // Installed by the app layer; the engine owns no config. Called on Commit
     // with the new personal output device (id + name).
@@ -112,6 +158,17 @@ public:
     DiagState GetDiag() const;
     bool PersonalOnFallback() const { return m_personalFallback.load(); }
     uint32_t MixRate() const { return m_mixRate; }
+    // Frames the mix has pulled since the engine started. Monotonic, and the
+    // only honest way to ask "is the mix actually running" without a clock on
+    // the audio thread.
+    //
+    // It exists for the peak meters. MixPull is driven by the personal render
+    // callback, so when there is no render device at all MixPull simply stops
+    // being called -- and a held peak would then sit frozen at whatever was
+    // playing when the device went away, presented as current. A stale peak is
+    // worse than no peak: it points at the wrong row. A caller on the control
+    // thread watches this for movement and reports kPeakUnknown when it stops.
+    uint64_t MixFrames() const { return m_mixFrames.load(std::memory_order_relaxed); }
 
 private:
     void MixPull(float* out, size_t frames);            // personal render callback
@@ -140,6 +197,10 @@ private:
     // this is set, and it is cleared again before any rebuild.
     std::atomic<bool> m_graphReady{false};
     std::atomic<uint32_t> m_mixRate{48000};   // read by the stream render thread
+    std::atomic<uint64_t> m_mixFrames{0};     // see MixFrames()
+    // TickWatchdog's bookkeeping: the frame count it last saw move, and when.
+    uint64_t m_lastWatchdogFrames = 0;
+    unsigned m_watchdogMovedMs = 0;
 
     // Cushions adapt to the consumer: a wired device pulls ~10 ms and gets the
     // ~30 ms base (the spec's latency budget); a Bluetooth device pulls in big

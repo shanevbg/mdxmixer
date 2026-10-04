@@ -50,6 +50,45 @@ MDXM_TEST_CASE(Pipe_EchoAndBroadcastRoundTrip) {
     CHECK(srv.ClientCount() == 0);
 }
 
+// HasSubscribers is what gates the 250 ms peak push, and it is asked before
+// the push is BUILT rather than inside Broadcast: that push needs an endpoint
+// sweep, which activates COM on every endpoint, and it runs forever. A
+// HasSubscribers that answered true for a connected-but-not-subscribed client
+// would turn "nobody asked for meters" into a permanent four-times-a-second
+// COM sweep that nothing reads.
+MDXM_TEST_CASE(Pipe_HasSubscribersIsNotJustConnected) {
+    PipeServer srv;
+    std::wstring err;
+    bool started = srv.Start([](const std::wstring& msg, bool* wantSub) {
+        if (msg == L"MDXM_SUBSCRIBE=1") { *wantSub = true; return std::vector<std::wstring>{L"MDXM_OK"}; }
+        if (msg == L"MDXM_SUBSCRIBE=0") { *wantSub = false; return std::vector<std::wstring>{L"MDXM_OK"}; }
+        return std::vector<std::wstring>{L"ECHO|" + msg};
+    }, &err, kTestPipe);
+    CHECK(started);
+    CHECK(!srv.HasSubscribers());                 // no clients at all
+
+    HANDLE h = CreateFileW(kTestPipe, GENERIC_READ | GENERIC_WRITE,
+                           0, nullptr, OPEN_EXISTING, 0, nullptr);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    DWORD mode = PIPE_READMODE_MESSAGE;
+    SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
+
+    CHECK(PipeRequest(h, L"MDXM_PING") == L"ECHO|MDXM_PING");
+    CHECK(srv.ClientCount() == 1);
+    CHECK(!srv.HasSubscribers());                 // connected is not subscribed
+
+    CHECK(PipeRequest(h, L"MDXM_SUBSCRIBE=1") == L"MDXM_OK");
+    CHECK(srv.HasSubscribers());
+
+    CHECK(PipeRequest(h, L"MDXM_SUBSCRIBE=0") == L"MDXM_OK");
+    CHECK(!srv.HasSubscribers());                 // and unsubscribing stops it
+
+    CloseHandle(h);
+    Sleep(100);
+    srv.Stop();
+    CHECK(!srv.HasSubscribers());                 // a dropped client is not one either
+}
+
 namespace {
 LRESULT CALLBACK MarshalWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);

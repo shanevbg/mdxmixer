@@ -19,6 +19,7 @@
 // channel, two faders, the same two-knob model the rest of the mixer uses.
 //
 // Control thread only: it does network I/O with short timeouts.
+#include "device/endpoint_volume.h"   // DeviceLevel, kPeakUnknown — no Windows types
 #include <string>
 #include <vector>
 
@@ -151,5 +152,28 @@ std::wstring SonarKeyFromChannelId(const std::wstring& id);
 std::wstring SonarWritePath(const std::wstring& key, bool personal,
                             bool streamMode, const wchar_t* property,
                             const std::wstring& value);
+
+// The peak on a Sonar channel's own virtual endpoint, found in a device list,
+// or kPeakUnknown when there is no endpoint to ask.
+//
+// It exists because Sonar's channel keys and its endpoint names are two
+// different vocabularies and the mapping is not derivable: the key is "game"
+// and the device is "Gaming"; the key is "chatCapture" and the device is
+// "Microphone". Spelled out rather than guessed, because a wrong join reports
+// one channel's level on another channel's row, which is worse than reporting
+// nothing at all. Pure, and tested, for the same reason SonarWritePath is.
+//
+// Worth doing at all because the Sonar meters are HONEST, which the write path
+// is not. Measured on 2026-10-04 with RarmaRadio playing to Aux: Aux read
+// 0.4457 and Stream 0.3050 then 0.3608 across successive reads, both tracking
+// the music, while Media and Gaming -- which had nothing routed to them -- read
+// a flat 0.0000.
+//
+// `masters` is deliberately absent and reports kPeakUnknown. Sonar's master is
+// an OUTPUT rather than an input, and in streamer mode its two halves land on
+// two different devices -- monitoring on the physical headphones, streaming on
+// the Stream endpoint -- so no single number speaks for it.
+float SonarChannelPeak(const std::vector<DeviceLevel>& levels,
+                       const std::wstring& key);
 
 } // namespace mdxm

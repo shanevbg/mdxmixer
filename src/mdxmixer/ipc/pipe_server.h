@@ -24,6 +24,11 @@ public:
     void Stop();
     void Broadcast(const std::wstring& msg);   // to subscribed clients only (MDXM_SUBSCRIBE=1)
     int  ClientCount() const;
+    // Is anyone listening? Asked before BUILDING a broadcast, not just before
+    // sending one: the peak push runs four times a second forever, and
+    // formatting thirty-odd records to hand them to nobody is the one cost
+    // this feature could have had and does not.
+    bool HasSubscribers() const;
     static constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\mdxmixer";
 
     struct Impl;   // public: the per-client context struct points back at it

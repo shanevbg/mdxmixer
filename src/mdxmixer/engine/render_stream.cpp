@@ -23,6 +23,13 @@ struct RenderStream::Impl {
     HANDLE hAudioEvent = nullptr;
     std::atomic<bool> ok{false};
     std::atomic<bool> invalidated{false};
+    // The event stopped firing without anything returning an error. Kept
+    // apart from `invalidated` because the two are genuinely different
+    // diagnoses and the log should be able to say which happened: a device
+    // that was REMOVED under us, against one that is still listed and still
+    // active and has simply stopped clocking. The second is what a Bluetooth
+    // headset does across a Modern Standby resume, and it was invisible.
+    std::atomic<bool> stalled{false};
     std::wstring error;
     uint32_t rate = 0;
 
@@ -92,9 +99,52 @@ struct RenderStream::Impl {
             std::vector<float> scratch((size_t)bufFrames * 2, 0.0f);
             const uint16_t dstCh = fmt.channels ? fmt.channels : 2;
             HANDLE waits[2] = { hStop, hAudioEvent };
+            // A BOUNDED wait, and the bound is the whole fix for a measured
+            // failure.
+            //
+            // This was INFINITE, while capture_stream.cpp has always used a
+            // 5 ms timeout because "events can be unreliable". That asymmetry
+            // cost Shane a morning of silence on 2026-10-04. Coming out of
+            // Modern Standby, the Bluetooth headset's endpoint stayed listed,
+            // stayed DEVICE_STATE_ACTIVE, and kept answering its volume and
+            // its meter -- while its render event simply stopped being
+            // signalled. Nothing returned an error, so `invalidated` was never
+            // set, and all four places in engine.cpp that ask Invalidated()
+            // were blind by construction. This thread sat here forever.
+            //
+            // What that looked like from outside, from MDXM_DIAG at the time:
+            //
+            //     MDXM_RING|id=sonar|depth=96000|drops=57654426|underruns=0
+            //     MDXM_DIAGDEV|personal={...Razer}|fallback=0
+            //
+            // depth at the ring's full 96000-frame capacity, 57.6 million
+            // frames dropped -- about twenty minutes of audio -- and
+            // underruns=0, which is the line that names the fault: the mix
+            // thread never once ran to find the ring empty, because MixPull is
+            // driven from THIS loop. The capture end was on a Sonar virtual
+            // endpoint, which survived the resume and went on filling a ring
+            // nothing drained.
+            //
+            // The device period here is ~10 ms, so this event should fire
+            // about a hundred times a second. Two consecutive 500 ms timeouts
+            // is a full second of silence from that: a stall, not a hiccup.
+            // Breaking out rather than only flagging it releases the device,
+            // exactly as an invalidation does, and the engine restarts the
+            // stream when it sees Dead().
+            //
+            // A false positive costs a sub-second gap while the stream
+            // re-prefills and restarts. A false negative cost twenty minutes.
+            constexpr DWORD kWaitMs = 500;
+            constexpr int kStallTimeouts = 2;
+            int timeouts = 0;
             for (;;) {
-                DWORD w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-                if (w == WAIT_OBJECT_0) break;
+                DWORD w = WaitForMultipleObjects(2, waits, FALSE, kWaitMs);
+                if (w == WAIT_OBJECT_0) break;          // Stop()
+                if (w == WAIT_TIMEOUT) {
+                    if (++timeouts >= kStallTimeouts) { stalled = true; break; }
+                    continue;
+                }
+                timeouts = 0;
                 UINT32 padding = 0;
                 hr = client->GetCurrentPadding(&padding);
                 if (hr == AUDCLNT_E_DEVICE_INVALIDATED) { invalidated = true; break; }
@@ -205,5 +255,6 @@ void RenderStream::Stop() {
 }
 
 bool RenderStream::Invalidated() const { return m_impl && m_impl->invalidated.load(); }
+bool RenderStream::Stalled() const { return m_impl && m_impl->stalled.load(); }
 
 } // namespace mdxm

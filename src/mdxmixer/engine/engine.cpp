@@ -186,6 +186,7 @@ bool Engine::StartImpl(const MixerConfig& cfg, std::wstring* err) {
             ch->streamingGain.Configure((double)m_mixRate);
             ch->personalGain.SnapTo(ch->pmute ? 0.0f : ch->pvol);
             ch->streamingGain.SnapTo(ch->smute ? 0.0f : ch->svol);
+            ch->peakHold.Configure(PeakHoldFramesFor(m_mixRate));
             ch->captureScratch.assign(kMaxPullFrames * 2, 0.0f);
             if (!StartChannelCapture(*ch, eps))
                 notes += ch->id + L": " + ch->healthMsg + L"; ";
@@ -345,18 +346,43 @@ void Engine::MixPull(float* out, size_t frames) {
             return;
         }
         if (frames > m_maxMixPull) m_maxMixPull = frames;
+        // Proof of life for the peak meters, before anything can return early
+        // for a reason that is not "the mix stopped".
+        m_mixFrames.fetch_add(frames, std::memory_order_relaxed);
         std::fill(m_pSum.begin(), m_pSum.begin() + frames * 2, 0.0f);
         std::fill(m_sSum.begin(), m_sSum.begin() + frames * 2, 0.0f);
         for (auto& chp : m_channels) {
             ChannelRuntime& ch = *chp;
-            if (!ch.healthy.load(std::memory_order_relaxed)) continue;
+            if (!ch.healthy.load(std::memory_order_relaxed)) {
+                // No capture running, so there is nothing to meter. "Cannot
+                // know", not "silent": a client sorting by what is making
+                // sound must not rank an unhealthy channel among the ones that
+                // are genuinely quiet.
+                ch.peakHold.MarkUnknown();
+                ch.peakPub.store(kPeakUnknown, std::memory_order_relaxed);
+                continue;
+            }
             if (!ch.cushionDone) {
-                if (ch.ring.Depth() < CushionFor(m_maxMixPull)) continue;   // silent until the cushion fills
+                if (ch.ring.Depth() < CushionFor(m_maxMixPull)) {
+                    // Healthy, and deliberately silent while the cushion fills.
+                    // Pushed as a real zero rather than skipped, so a held peak
+                    // from before a dropout expires on schedule instead of
+                    // being frozen by the gap that follows it.
+                    ch.peakHold.Push(0.0f, frames);
+                    ch.peakPub.store(ch.peakHold.Value(), std::memory_order_relaxed);
+                    continue;                                      // silent until the cushion fills
+                }
                 ch.cushionDone = true;
             }
             size_t real = ch.ring.Read(m_chanBuf.data(), frames);
             if (real < frames) ch.cushionDone = false;             // rebuild after a gap
             ch.eq.Process(m_chanBuf.data(), frames);
+            // The channel's own signal: post EQ, PRE the two gains. See
+            // ChannelState::peak -- one source and two gains means a post-fader
+            // peak would have to be two numbers, and "which of these is making
+            // sound" stays true of a channel muted on one side.
+            ch.peakHold.Push(BlockPeak(m_chanBuf.data(), frames), frames);
+            ch.peakPub.store(ch.peakHold.Value(), std::memory_order_relaxed);
             memcpy(m_pBuf.data(), m_chanBuf.data(), frames * 2 * sizeof(float));
             memcpy(m_sBuf.data(), m_chanBuf.data(), frames * 2 * sizeof(float));
             ch.personalGain.Process(m_pBuf.data(), frames);
@@ -415,6 +441,10 @@ void Engine::ReconfigureForMixRate() {
             ch.eq.SetBand(b, ch.eqBands[b].freq, ch.eqBands[b].gainDb, ch.eqBands[b].q);
         ch.personalGain.Configure((double)rate);
         ch.streamingGain.Configure((double)rate);
+        // The hold is a frame count, so it is rate-dependent like everything
+        // else here: left at the old rate it would hold for the wrong duration
+        // after a move from 44.1 to 96 kHz.
+        ch.peakHold.Configure(PeakHoldFramesFor(rate));
         StartChannelCapture(ch, eps);   // re-derives the resampler rates, clears the ring
     }
     // The stream thread re-derives its own resampler on the next cushion rebuild.
@@ -536,11 +566,116 @@ void Engine::EnsurePersonalRender(const std::vector<EndpointInfo>& eps) {
     std::wstring want = bound ? bound->id
                               : PickPersonalOutput(eps, m_boundPersonal,
                                                    DefaultRenderEndpointId(), CaptureSources());
-    bool renderDead = m_personalRender.Invalidated();
+    // Dead(), not Invalidated(). A stalled stream never sets `invalidated`
+    // and is exactly how this fails across a resume: the endpoint is still
+    // listed and still active, so `bound` matches, `want` equals
+    // m_currentPersonalId, and this returned early leaving a dead stream in
+    // place. That early return is what made the silence permanent.
+    bool renderDead = m_personalRender.Dead();
     if (want.empty()) { if (renderDead) m_personalRender.Stop(); return; }
     if (!renderDead && want == m_currentPersonalId) return;
     m_personalRender.Stop();
     StartPersonalRender(want);
+}
+
+// Is the mix actually being pulled? Control thread, ~1 s.
+//
+// The LAST line of defence, and it is here because the two detectors above it
+// can both be clean while there is still silence. RenderStream::Dead() catches
+// a stream that noticed; the device notifications catch an endpoint that went
+// away. Neither catches a render thread that is alive and clocking while
+// MixPull is not actually running -- a graph left not-ready by a rebuild that
+// failed halfway, a Stop() that raced a restart. The only honest test is
+// whether frames are moving, which is what Engine::MixFrames is for.
+//
+// It is also the backstop for the power notifications: PBT_APMSUSPEND and
+// PBT_APMRESUMEAUTOMATIC are not guaranteed to arrive for every Modern
+// Standby transition, and a recovery that depends on a message Windows may
+// not send is not a recovery.
+bool WatchdogShouldRestart(bool framesMoved, bool haveRender, unsigned stuckMs) {
+    if (framesMoved) return false;   // it is working
+    if (!haveRender) return false;   // nothing is supposed to be pulling
+    return stuckMs >= kWatchdogStuckMs;
+}
+
+void Engine::TickWatchdog() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const unsigned now = (unsigned)GetTickCount();
+    const uint64_t frames = m_mixFrames.load(std::memory_order_relaxed);
+    const bool framesMoved = (frames != m_lastWatchdogFrames) || m_watchdogMovedMs == 0;
+    const bool haveRender = !m_currentPersonalId.empty();
+    const unsigned stuckMs = now - m_watchdogMovedMs;
+
+    if (framesMoved) {
+        m_lastWatchdogFrames = frames;
+        m_watchdogMovedMs = now;
+        return;
+    }
+    // Nothing is supposed to be running: no output device, or the engine is
+    // stopped. Keep the clock moving so a later start is not instantly
+    // "overdue" and restarted the moment it comes up.
+    if (!haveRender) { m_watchdogMovedMs = now; return; }
+    if (!WatchdogShouldRestart(framesMoved, haveRender, stuckMs)) return;
+
+    Log(1, L"watchdog: no mix pull for %u ms (invalidated=%d stalled=%d) -- restarting the render",
+        stuckMs, m_personalRender.Invalidated() ? 1 : 0, m_personalRender.Stalled() ? 1 : 0);
+    const std::wstring id = m_currentPersonalId;
+    m_personalRender.Stop();
+    if (!StartPersonalRender(id))
+        Log(1, L"watchdog: %ls would not take a render; leaving it to failover", id.c_str());
+    // Reset either way. On success frames start moving again and the next tick
+    // records it; on failure this stops us retrying the same dead device four
+    // times a second and lets the failover watcher re-home instead.
+    m_watchdogMovedMs = (unsigned)GetTickCount();
+}
+
+void Engine::OnSuspend() {
+    // Stop the render BEFORE the machine goes down, so there is nothing to
+    // come back to in an undefined state. Cheap, and it turns the resume from
+    // "work out what survived" into "start fresh".
+    //
+    // Best-effort: Windows allows about two seconds here, and a Modern
+    // Standby transition may not deliver this at all. The watchdog is what
+    // makes the recovery unconditional.
+    Log(2, L"suspend: stopping the personal render");
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_personalRender.Stop();
+}
+
+void Engine::OnResume() {
+    Log(2, L"resume: holding failover, rebinding devices, restarting the render");
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // HOLD THE WATCHER FIRST, before anything can tick it.
+        //
+        // Its stability, dwell and minimum-gap windows are all wall-clock, and
+        // a suspend advances the wall clock by hours -- so every one of them is
+        // already expired the instant we wake, and the watcher would commit on
+        // its first post-resume tick against a device list that is still
+        // settling. The log line at 04:46:20 on 2026-10-04, a bare "failover
+        // committed" with nothing before it for seven hours, is that happening.
+        // Same 15 s ceiling the all-devices-absent case uses, and released
+        // early the same way once things look steady.
+        m_failover.HoldFor(15000);
+        // Unconditionally, rather than asking whether it is dead: a stalled
+        // stream takes a second to admit it, and a resume is exactly when one
+        // is most likely. Restarting a healthy stream costs a sub-second gap
+        // on a machine that was asleep a moment ago, which nobody hears.
+        m_personalRender.Stop();
+        m_watchdogMovedMs = 0;   // the frame count will not move until it is back
+    }
+    // Captures first: a channel whose source is a Sonar virtual endpoint has
+    // to be re-bound before there is anything worth rendering.
+    OnDeviceSetChanged();
+    // And then the render, EXPLICITLY. TickFailover will not do it: Stop()
+    // frees the stream's impl, so Dead() reads false afterwards, and with the
+    // bound device present and no fallback in force none of its three branches
+    // fire. Relying on it here would leave the render down until something
+    // else happened to change.
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        EnsurePersonalRender(EnumerateEndpoints());
+    }
 }
 
 void Engine::OnDeviceSetChangedImpl() {
@@ -627,7 +762,7 @@ void Engine::TickFailover() {
         // re-enumerating per call: the watcher asks about every allowlist
         // entry on every tick.
         bool boundPresent = MatchBinding(m_epSnapshot, m_boundPersonal) != nullptr;
-        if (boundPresent && m_personalRender.Invalidated()) boundPresent = false;   // enumeration lag
+        if (boundPresent && m_personalRender.Dead()) boundPresent = false;   // enumeration lag, or a stalled stream
 
         // ── The temporary fallback is the ENGINE's business, not the
         // watcher's ──────────────────────────────────────────────────────
@@ -644,7 +779,7 @@ void Engine::TickFailover() {
         } else if (boundPresent && m_personalFallback) {
             m_personalFallback = false;
             EnsurePersonalRender(m_epSnapshot);
-        } else if (m_personalRender.Invalidated()) {
+        } else if (m_personalRender.Dead()) {
             EnsurePersonalRender(m_epSnapshot);
         }
 
@@ -710,7 +845,8 @@ std::vector<ChannelState> Engine::GetChannelStates() const {
     std::vector<ChannelState> out;
     for (const auto& c : m_channels)
         out.push_back({ c->id, c->name, c->healthy.load(),
-                        c->pvol, c->pmute, c->svol, c->smute, c->eqEnabled });
+                        c->pvol, c->pmute, c->svol, c->smute, c->eqEnabled,
+                        c->peakPub.load(std::memory_order_relaxed) });
     return out;
 }
 

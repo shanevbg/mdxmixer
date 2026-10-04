@@ -104,7 +104,13 @@ struct Row {
     // stable_partition across the entire fader list, so a failover device
     // outranks every channel too. This is that behaviour on a sectioned layout.
     bool atTop = false;
-    float peak = 0.0f;        // DeviceVolume: what is actually flowing, 0..1
+    // What is actually flowing, 0..1, or kPeakUnknown (-1) when there is no
+    // meter to read. The meter below draws only for peak > 0, so an unknown
+    // row paints nothing -- which is right, and is also what a zero did, so
+    // the -1 costs no extra handling here. It matters on the wire, where a
+    // client sorting by what is making sound must not read "cannot know" as
+    // "silent" (docs/ipc.md §2.1).
+    float peak = kPeakUnknown;
 };
 
 struct MixerTabState {

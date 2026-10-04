@@ -390,4 +390,47 @@ bool SonarChannels::SetMute(const std::wstring& key, bool personal, bool mute) {
     return true;
 }
 
+// ── Joining a peak onto a Sonar channel ──────────────────────────────────
+
+namespace {
+
+// Sonar's channel key -> the tail of its endpoint's Windows name. See the
+// declaration in the header for why this is a table and not a transform, and
+// for why `masters` is absent.
+const wchar_t* SonarEndpointSuffix(const std::wstring& key) {
+    if (key == L"aux")         return L"Aux";
+    if (key == L"media")       return L"Media";
+    if (key == L"game")        return L"Gaming";
+    if (key == L"chatRender")  return L"Chat";
+    if (key == L"chatCapture") return L"Microphone";
+    return nullptr;
+}
+
+} // namespace
+
+float SonarChannelPeak(const std::vector<DeviceLevel>& levels,
+                       const std::wstring& key) {
+    const wchar_t* suffix = SonarEndpointSuffix(key);
+    if (!suffix) return kPeakUnknown;
+    // Matched on `name`, which is what WINDOWS calls the device, and never on
+    // `displayName`: an alias is the user's to change, and a join that breaks
+    // when someone renames "SteelSeries Sonar - Aux" to "Radio" is a join that
+    // will break.
+    //
+    // Prefix rather than equality, because the real name carries the driver in
+    // parentheses after it -- "SteelSeries Sonar - Aux (SteelSeries Sonar
+    // Virtual Audio Device)".
+    //
+    // The FLOW is part of the match. Sonar publishes a device called
+    // "SteelSeries Sonar - Microphone" on both flows, and the chat mic channel
+    // means the capture one; taking whichever came first in the list would be
+    // a coin toss that looks right until the enumeration order changes.
+    const bool wantRender = (key != L"chatCapture");
+    const std::wstring want = std::wstring(L"SteelSeries Sonar - ") + suffix;
+    for (const auto& d : levels)
+        if (d.isRender == wantRender && d.name.rfind(want, 0) == 0)
+            return d.peak;
+    return kPeakUnknown;
+}
+
 } // namespace mdxm

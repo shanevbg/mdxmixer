@@ -152,6 +152,22 @@ static void ListEndpointVolumesBody(void* ctx) {
                     // What is actually flowing, alongside what the level is
                     // set to: the reading that says whether audio is reaching
                     // the device at all.
+                    //
+                    // lvl.peak is assigned ONLY on success, so a meter that
+                    // will not activate or will not answer leaves kPeakUnknown
+                    // standing rather than reporting silence. An endpoint that
+                    // never reaches this branch at all -- an UNPLUGGED one --
+                    // keeps it for the same reason.
+                    //
+                    // This reads honestly through a Sonar VIRTUAL endpoint,
+                    // which is not obvious and was measured on 2026-10-04 with
+                    // RarmaRadio playing to Sonar Aux: Aux 0.4457 and Stream
+                    // 0.3050/0.3608 across successive reads, both varying with
+                    // the music, while Media and Gaming -- which have nothing
+                    // routed to them -- read a flat 0.0000. So the Sonar write
+                    // path lies (SetMasterVolumeLevelScalar returns success and
+                    // holds at 1.0) and the READ path does not. That asymmetry
+                    // is what lets a Sonar channel carry a real peak.
                     IAudioMeterInformation* meter = nullptr;
                     if (SUCCEEDED(dev->Activate(__uuidof(IAudioMeterInformation),
                                                 CLSCTX_ALL, nullptr, (void**)&meter)) && meter) {

@@ -17,8 +17,29 @@ namespace mdxm {
 
 enum class Mix { Personal, Streaming };
 
+// One channel as every surface sees it. `peak` is what the channel's SOURCE is
+// carrying — see the field comment below, which is the part a client has to
+// read before sorting on it.
 struct ChannelState { std::wstring id, name; bool healthy;
-                      float pvol; bool pmute; float svol; bool smute; bool eqOn; };
+                      float pvol; bool pmute; float svol; bool smute; bool eqOn;
+                      // The channel's own signal, 0..1, or kPeakUnknown (-1).
+                      //
+                      // BEFORE the personal and streaming faders, deliberately.
+                      // A channel has one source and TWO gains, so a post-fader
+                      // peak would have to be two numbers; and the question this
+                      // answers is "which of these is making sound", which stays
+                      // true of a channel muted on one side. A peak-hold, so a
+                      // row that spikes is still findable a moment later: the
+                      // motivating case is twenty-five faders and one of them
+                      // suddenly blasting, where "the fader positions do not
+                      // move when it happens" and nothing else in the state can
+                      // point at the culprit.
+                      //
+                      // -1 means CANNOT KNOW and is not the same answer as 0.0
+                      // meaning silence: an unhealthy channel has no capture to
+                      // meter, and reporting it as quiet would sort it among the
+                      // channels that are genuinely quiet.
+                      float peak = kPeakUnknown; };
 struct DiagState    { struct Ring { std::wstring id; size_t depth; uint64_t drops, underruns; };
                       std::vector<Ring> rings; std::wstring personalDevice; bool personalFallback = false;
                       size_t maxMixPull = 0; };   // largest personal-render pull seen (burst size)

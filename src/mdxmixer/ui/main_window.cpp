@@ -555,8 +555,41 @@ LRESULT MainWindow::Handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetTimer(hwnd, kTimerDeviceDebounce, 500, nullptr);
         return 0;
 
+    // Suspend and resume. A top-level window receives these with nothing to
+    // register for, which is the only reason this is cheap enough to have
+    // been an oversight rather than a decision.
+    //
+    // PBT_APMRESUMEAUTOMATIC fires for every wake; PBT_APMRESUMESUSPEND only
+    // when a user is present. Both are handled and the engine's resume path is
+    // idempotent, because a wake with no user is still a wake and the mixer
+    // still has to be playing when he sits down.
+    //
+    // Not relied upon. Modern Standby does not guarantee these for every
+    // transition, so Engine::TickWatchdog recovers without them; this only
+    // makes the recovery immediate instead of three seconds late, and puts a
+    // line in the log saying a resume happened at all.
+    case WM_POWERBROADCAST:
+        switch (wp) {
+        case PBT_APMSUSPEND:
+            if (m_ctx->onSuspend) m_ctx->onSuspend();
+            break;
+        case PBT_APMRESUMEAUTOMATIC:
+        case PBT_APMRESUMESUSPEND:
+            if (m_ctx->onResume) m_ctx->onResume();
+            break;
+        default:
+            break;
+        }
+        return TRUE;   // TRUE, not 0: for PBT_APMQUERYSUSPEND 0 means "deny"
+
     case WM_TIMER:
         if (wp == kTimerRefresh) {
+            // UNCONDITIONAL, before the visible-only refresh below. This is
+            // the peak push, and a client watching for which channel just
+            // started blasting is watching exactly when mdxmixer is in the
+            // tray and nobody is looking at its window. It costs one atomic
+            // read when nothing is subscribed.
+            if (m_ctx->onTick250ms) m_ctx->onTick250ms();
             if (IsWindowVisible(hwnd) && m_pages[m_activeTab])
                 SendMessageW(m_pages[m_activeTab], kRefreshMsg, 0, 0);
         } else if (wp == kTimerTick1s) {

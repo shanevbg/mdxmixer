@@ -73,6 +73,7 @@ below exists.
 | `pvol` `pmute` | the Personal fader — what the user hears |
 | `svol` `smute` | the Streaming fader — what goes out |
 | `eq` | `1` when the channel's EQ is enabled |
+| `peak` | what the channel's **source** is carrying, `0..1`, or `-1` — see §2.1 |
 
 **`MDXM_ROUTE|id=personal|device=<endpointId>`** — where a route is actually
 playing right now. Read this rather than the configured output: failover may
@@ -97,6 +98,7 @@ recomputing anything:
 | `hidden` `pinned` | how the user has filed it |
 | `container` | ContainerId: the same physical device, across its endpoints |
 | `bt` | the headset's Bluetooth address — see §6 |
+| `peak` | what is **flowing** on the endpoint, `0..1`, or `-1` — see §2.1 |
 
 > **`active`, not `present`.** mdxmixer's internal `present` flag means
 > *paired*, which is true of a headset switched off in a drawer. Anything
@@ -117,6 +119,102 @@ recomputing anything:
 → framed. `MDXM_RING` per ring buffer (fill, overruns, underruns) and
 `MDXM_DIAGDEV` with the live personal device and whether it is on a fallback.
 For troubleshooting, not for driving a UI.
+
+---
+
+## 2.1 `peak` — finding the row that is making the noise
+
+`MDXM_CHAN` and `MDXM_DEVLVL` both carry a `peak`. It answers one question:
+**which of these is making sound right now.**
+
+That question has no other answer in the state. A channel that suddenly starts
+blasting does not move its own fader, so nothing else in `MDXM_CHAN`
+distinguishes it from the twenty-four quiet channels beside it. Sorting a list
+by `peak` is the intended use; opening a list *on* the row that is currently
+audible is the other.
+
+### Read `-1` before you read anything else
+
+```text
+peak=-1     nobody can say
+peak=0      there is a reading, and it is silence
+```
+
+These are different answers and the difference is the whole point. An
+unhealthy channel has no capture to meter; an endpoint Windows has parked as
+unplugged has no meter to activate. Reporting either as `0` would look
+authoritative and sort it among the sources that are genuinely quiet. Treat
+`-1` as *absent*, exactly as you already do for `battery`.
+
+`-1` also appears when the mix itself has stopped — no render device at all,
+so nothing is being pulled. A frozen meter is worse than a blank one, because
+it points at the wrong row.
+
+### It is a peak **hold**, not an instantaneous level
+
+The value is the highest seen in the last **1.5 seconds**, then it releases.
+
+An instantaneous read is useless here. The chain from this pipe to a phone
+screen is mdxmixer → MDropDX12 → MDR_Android, and a transient is long gone by
+the time any of that has redrawn; the row that blasted would look exactly like
+the ones that did not. 1.5 s is long enough to survive that trip and short
+enough that the meter still tracks the music rather than describing the recent
+past — if it held for five seconds, two channels that took turns being loud
+would both read loud and the ordering would say nothing.
+
+A steady signal does not expire and re-latch, so a list ordered by `peak` does
+not flicker between redraws.
+
+### On a channel it is measured *before* the faders
+
+`MDXM_CHAN|peak` is the channel's **source**, after its EQ and before both
+gain stages. Three consequences:
+
+- A channel muted on one side still reports its peak. "What is making sound"
+  stays true of audio you have chosen not to hear.
+- The number does not move when a fader does. It is a property of the signal,
+  not of the mix.
+- It is one number, not two. A channel has one source and two gains, so a
+  post-fader peak would have to be a personal one and a streaming one.
+
+`MDXM_DEVLVL|peak` is the opposite end: what Windows is actually putting on
+that endpoint, after everything. Set against `vol`, which is only where the
+slider sits, it separates *nothing is being sent here* from *something is
+being sent and you cannot hear it*.
+
+> **Do not compare a peak on one row against a peak on a different kind of
+> row.** Measured here on 2026-10-04 with one radio stream playing: its Sonar
+> source endpoint read `0.4457` while the headphones it was being mixed down
+> to read `0.0027`, because the personal mix on this machine runs at a few
+> percent. Both are correct and they are not on the same scale. Order channels
+> against channels, and endpoints against endpoints.
+
+### Sonar's channels carry a real peak
+
+A `sonar:` channel's peak comes from its own virtual endpoint —
+`sonar:aux` from "SteelSeries Sonar - Aux", `sonar:game` from "… - Gaming",
+`sonar:chatCapture` from the *capture* side of "… - Microphone".
+
+This is worth knowing because Sonar's write path famously lies: a Sonar
+virtual endpoint accepts `SetMasterVolumeLevelScalar`, returns success, and
+stays at 1.0, which is the whole reason §5 exists. The **read** path does not.
+Measured on 2026-10-04 with a radio stream playing to Aux: Aux read `0.4457`
+and Stream `0.3050` then `0.3608` across successive reads, both tracking the
+music, while Media and Gaming — which had nothing routed to them — read a flat
+`0.0000`.
+
+`sonar:masters` always reports `-1`, and that is not a gap. Sonar's master is
+an output rather than an input, and in streamer mode its two halves land on two
+different devices — monitoring on the physical headphones, streaming on the
+Stream endpoint — so no single number speaks for it.
+
+### Cost
+
+Nothing is started to produce this. Endpoint peaks come from the device sweep
+that already runs to build `MDXM_DEVLVL`; channel peaks are a maximum taken
+over a block the mix loop is already reading twice to sum. There is no metering
+timer to turn on, so there is nothing to subscribe to and nothing to switch
+off — unlike the audio feed in §8, which genuinely is off until asked.
 
 ---
 
@@ -270,12 +368,47 @@ Bluetooth address belongs to the headset, which is why it leads.
 ## 7. Staying in sync
 
 `MDXM_SUBSCRIBE|1` turns this connection into a listener. Thereafter
-mdxmixer pushes `MDXM_CHAN` and `MDXM_ROUTE` records whenever state changes,
-unprompted, on the same connection. `MDXM_SUBSCRIBE|0` stops it.
+mdxmixer pushes records to it unprompted, on the same connection.
+`MDXM_SUBSCRIBE|0` stops it.
 
 Prefer this to polling `MDXM_STATE`. A subscription costs nothing while
 nothing is happening, and a poll fast enough to feel live is a full state
 block many times a second.
+
+Two kinds of push arrive, and the difference matters:
+
+| | when | what it means |
+| --- | --- | --- |
+| `MDXM_CHAN`, `MDXM_ROUTE` | something **changed** | a fader moved, a route switched, Sonar came back |
+| `MDXM_PEAK` | every **250 ms** | nothing changed; the levels moved |
+
+Kept apart on purpose. Peaks move constantly and change nothing, so carrying
+them on `MDXM_CHAN` would mean re-reading every fader position you already
+know four times a second — and you could no longer tell a push that means
+"someone moved a fader" from one that means "the music got louder".
+
+### `MDXM_PEAK`
+
+```text
+MDXM_PEAK|chan=game~0.42|chan=sonar:aux~0.4457|chan=mic~-1
+         |dev={0.0.0.00000000}.{cc8e…}~0.0027|dev={0.0.0.00000000}.{3090…}~-1
+```
+
+Repeated `chan=` and `dev=` keys, each `<id>~<peak>`, in one message. Values
+follow §2.1 exactly, `-1` included.
+
+- **Complete, never a delta.** Every channel and every endpoint appears every
+  time, so you need not remember what you were last told, and a row that is
+  absent genuinely no longer exists.
+- **Only while someone is subscribed.** With no listener nothing is formatted
+  and no endpoint sweep is run for it. This is the one ongoing cost the
+  feature could have had, and it is paid only on request.
+- **It arrives while mdxmixer is in the tray.** Which is the point: a client
+  watching for the channel that just started blasting is watching precisely
+  when nobody is looking at mdxmixer's own window.
+
+Ignore the verb entirely if you do not want meters; nothing else depends on
+it.
 
 ---
 

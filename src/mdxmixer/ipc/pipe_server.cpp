@@ -291,4 +291,12 @@ int PipeServer::ClientCount() const {
     return n;
 }
 
+bool PipeServer::HasSubscribers() const {
+    if (!m_impl) return false;
+    std::lock_guard<std::mutex> lock(m_impl->clientsMutex);
+    for (auto* ctx : m_impl->clients)
+        if (!ctx->finished.load() && ctx->subscribed.load()) return true;
+    return false;
+}
+
 } // namespace mdxm

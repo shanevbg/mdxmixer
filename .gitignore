@@ -8,3 +8,6 @@ mdxmixer.json
 # Release artifacts: built by release.ps1, published to GitHub Releases.
 # Nothing here is a source input.
 /dist/
+
+# Playwright MCP scratch output (diagram previews, page snapshots).
+/.playwright-mcp/

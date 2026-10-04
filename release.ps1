@@ -110,7 +110,12 @@ $payload = @(
 # links. Added by directory rather than named one by one: the screenshots are
 # REGENERATED (MDXM_TAB + MDXM_CAPTURE, see the end of the README), so a hand
 # written list here is a list that goes stale the first time a shot is added.
-foreach ($img in (Get-ChildItem (Join-Path $root 'docs\images') -File -ErrorAction SilentlyContinue)) {
+#
+# Filtered to image extensions rather than taking the whole directory: that
+# folder also holds _preview.html, which exists to render the SVGs in a
+# browser while editing them, and a scratch file has no business in a release.
+foreach ($img in (Get-ChildItem (Join-Path $root 'docs\images') -File -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Extension -in '.png', '.svg', '.jpg', '.gif', '.webp' })) {
     $payload += @{ From = $img.FullName; To = "docs\images\$($img.Name)" }
 }
 

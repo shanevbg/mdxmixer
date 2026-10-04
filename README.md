@@ -34,16 +34,20 @@ Everything else grew out of living with that:
 
 - once something else owned the routing, **virtual cables** kept apps from
   ever pointing at a headset that might vanish;
-- once audio was being mixed anyway, the **two-fader** idea became possible —
-  a quiet level for your ears and a full level for everyone else;
+- Sonar's best idea — **two levels per channel**, one for your ears and one
+  for everyone else — was worth keeping even on the days Sonar was the
+  problem, so it became the model the whole mixer is built around;
 - once there were seven identically-named headsets in the list, they needed
   **short names** and a **last seen** column;
 - and once the batteries were the thing that decided which pair you reached
   for, a small **floating battery readout** earned its place on screen.
 
-Sonar is still supported — its channels appear here as ordinary faders — but
-it is no longer load-bearing. [docs/rollout.md](docs/rollout.md) walks through
-moving off it one app at a time, in an order you can back out of at any step.
+Which leaves Sonar in an odd position here: it is both the thing that caused
+this and a thing worth keeping. Its channels appear as ordinary faders and
+mdxmixer drives both of their levels, but it is no longer load-bearing — it
+can hang, come back late, or not come back at all, and the mixer carries on.
+[docs/rollout.md](docs/rollout.md) walks through moving off it one app at a
+time, in an order you can back out of at any step.
 
 ---
 
@@ -60,6 +64,66 @@ it down for yourself and the stream goes quiet; turn it up for the stream and
 you flinch.
 
 Here they are simply two numbers.
+
+### Where the second number actually comes from
+
+Worth being straight about, because the answer is probably Sonar.
+
+Almost nothing does this. Windows gives you one level per app. The per-app
+mixers give you a nicer version of one level per app. A general-purpose
+virtual mixer can be wired up to do it, but you are building and maintaining a
+patchbay to get there. Sonar is the one piece of consumer software that just
+has it — and having gone looking for something better, there wasn't anything.
+That is the whole reason Sonar is still supported here despite being the thing
+that used to take the audio graph down: it does the one trick nothing else
+does conveniently.
+
+**Through Sonar.** In streamer mode Sonar already maintains two separate mixes
+— it calls them monitoring and streaming — for each of Aux, Media, Game, Chat,
+Mic and Master. That is the same two-knob model, and it is the one doing the
+work on a typical setup. mdxmixer shows those channels as ordinary rows and
+drives both of Sonar's levels for you, which it has to do over Sonar's own
+local API: Sonar's virtual devices will accept a Windows volume change, report
+success, and quietly ignore it. **If you have Sonar, this is what you are
+using, and it works today with no cables at all.**
+
+**Through mdxmixer's own channels**, the split happens in its mixer instead —
+one source, two gain stages, two sums. The personal sum goes to your
+headphones. The streaming sum needs somewhere to go, and there are two places
+it can:
+
+- **A streaming cable.** Set one on the Devices tab and your recorder captures
+  that cable, like any other input. This is the ordinary route.
+- **The shared-memory ring**, for a program that wants the audio rather than a
+  device. A client asks for it with `MDXM_FEED|1` and reads
+  `Local\mdxmixer_stream_v1`; no cable, no driver, nothing to install. It is
+  **off until something asks**, because when Sonar is working it is already
+  mixing this audio and two live sources of it work against each other.
+  Right now **MDropDX12 3.3+ is the only thing that reads it**, and that path
+  is new enough to still want testing.
+
+  This is the common case in practice, and it is worth being clear why: a
+  visualiser wants to *see* your music, which is a different thing from a
+  recorder wanting to *keep* it. Most of what comes out of these faders is
+  other people's media, and sending it all to a recording by default would be
+  the wrong instinct. An OBS plugin that read the ring would be easy enough
+  to write — nobody has needed one.
+
+If neither is set up, the streaming sum is computed and thrown away, so the
+`[S]` fader on a native channel moves nothing anybody can hear. That is a
+setting, not a limitation, but it is the step people miss.
+
+So, in short:
+
+| you have | the `[P]` fader | the `[S]` fader |
+| --- | --- | --- |
+| Sonar | works | works — Sonar keeps both mixes |
+| a streaming cable | works | works — your recorder captures the cable |
+| a feed subscriber | works | works — mdx12 3.3+ reads the ring |
+| none of those | works | moves nothing |
+
+The quiet-for-you half works in every row, because that is just your output
+level, and it is the half that matters most of the time.
 
 ---
 
@@ -152,8 +216,10 @@ never have to hunt for it. Below that, every channel with its `[P]` and `[S]`
 pair.
 
 Notice `Game [P]` at 23 and `Game [S]` at 100 — quiet in the room, normal on
-the stream. And the little green bars: those are live meters, so you can see
-which row is actually making a noise.
+the stream. That is a Sonar channel, so both of those numbers are Sonar's own
+monitoring and streaming levels, being driven from here. And the little green
+bars: those are live meters, so you can see which row is actually making a
+noise.
 
 Right-click any row to move it, pin it to the top, hide it, or rename it.
 Those two columns of `-10` / `+10` buttons are one of the two fader styles —
@@ -191,11 +257,13 @@ in.
 | | | |
 | --- | --- | --- |
 | [**VB-CABLE**](https://vb-audio.com/Cable/) | donationware | The virtual cables. Needed for per-app channels; not needed if you only want control over the devices you already have. Take the A+B and C+D packs from the same page for five cables in total. |
-| [**SteelSeries Sonar**](https://steelseries.com/gg/sonar) | free | Optional. If you already run it, its channels appear here as ordinary faders. You do not need it — this exists partly because of it — but nothing makes you remove it. |
-| [**OBS Studio**](https://obsproject.com/) | free | Optional. The usual thing on the receiving end of the streaming mix. Anything that can record an audio input works. |
+| [**SteelSeries Sonar**](https://steelseries.com/gg/sonar) | free | The easiest way to get the two-fader split working, because it keeps both mixes itself — see above. This project exists partly because of Sonar's habit of taking the audio graph down with a Bluetooth headset, and it is still the most convenient answer to the one problem nothing else solves. |
+| [**MDropDX12**](https://github.com/shanevbg/MDropDX12) | free | The MilkDrop-style music visualiser this grew up alongside, and the thing most likely to be on the other end of the streaming mix. From **3.3** it reads that mix straight out of the shared-memory ring, so it needs no cable, no recording software and no extra audio device. It also drives this mixer over the pipe rather than touching Windows audio itself. |
+| [**OBS Studio**](https://obsproject.com/) | free | Only if you actually record. It wants the streaming **cable**, not the ring — nothing reads the ring but MDropDX12 today, though an OBS plugin for it would be straightforward if anyone wanted one. Worth saying plainly: feeding a recorder everything you listen to is usually the wrong default, because most of it is other people's music. |
 
-Neither of the first two is required to use mdxmixer as a plain volume mixer
-for your real devices with a failover list and a battery overlay.
+None of these is required to use mdxmixer as a plain volume mixer for the
+devices you already have, with a failover list and a battery overlay. They
+matter once you want the second fader to go somewhere.
 
 ---
 
@@ -219,15 +287,24 @@ are different keys.
 
 ## Driving it from another program
 
-MDropDX12 keeps its own mixer window but, when mdxmixer is running, reads and
-writes **through** it rather than calling the Windows audio APIs itself. Two
-programs both moving endpoints is how a route gets flapped between them, and
-the failover watcher has to be the only one deciding.
+[MDropDX12](https://github.com/shanevbg/MDropDX12) keeps its own mixer window
+but, when mdxmixer is running, reads and writes **through** it rather than
+calling the Windows audio APIs itself. Two programs both moving endpoints is
+how a route gets flapped between them, and the failover watcher has to be the
+only one deciding.
 
 Connect to `\\.\pipe\mdxmixer` and talk a line-oriented text protocol:
 `MDXM_STATE` for everything, `MDXM_SUBSCRIBE|1` to be told when it changes,
-`MDXM_FAILOVER` for the rule and what it currently sees. Every verb is in
-**[docs/ipc.md](docs/ipc.md)**.
+`MDXM_FAILOVER` for the rule and what it currently sees, `MDXM_PEAK` four
+times a second for which channel is making a noise.
+
+If you want the audio itself rather than a description of it, `MDXM_FEED|1`
+publishes the streaming mix into shared memory — this is the second home for
+the `[S]` fader described above, and the one that needs no cable and no
+driver. It stays off until asked. **MDropDX12 3.3 and later is currently the
+only reader**, and new enough that it still wants testing.
+
+Every verb is in **[docs/ipc.md](docs/ipc.md)**.
 
 ---
 

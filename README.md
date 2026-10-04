@@ -69,14 +69,27 @@ Here they are simply two numbers.
 
 Worth being straight about, because the answer is probably Sonar.
 
-Almost nothing does this. Windows gives you one level per app. The per-app
-mixers give you a nicer version of one level per app. A general-purpose
-virtual mixer can be wired up to do it, but you are building and maintaining a
-patchbay to get there. Sonar is the one piece of consumer software that just
-has it — and having gone looking for something better, there wasn't anything.
-That is the whole reason Sonar is still supported here despite being the thing
-that used to take the audio graph down: it does the one trick nothing else
-does conveniently.
+Not much does this. Windows gives you one level per app, and the per-app
+mixers give you a nicer version of one level per app — one number, however
+many places the sound is going.
+
+Two things have it properly:
+
+- **[SteelSeries Sonar](https://steelseries.com/gg/sonar)**, free, in streamer
+  mode. This is what most people with it are already using, and what mdxmixer
+  drives today.
+- **[Voicemeeter Potato](https://vb-audio.com/Voicemeeter/potato.htm)**, from
+  the people who make the cables. Its `GainLayer` is a per-strip, per-bus gain
+  — one input, an independent level for every output bus — which is the same
+  idea under a different name. Note **Potato specifically**: Standard and
+  Banana give one gain per strip plus per-bus masters, which is not the same
+  thing.
+
+mdxmixer does not drive Voicemeeter yet. It is the better of the two targets
+on paper — a documented C API (`VoicemeeterRemote.dll`, with an official
+[SDK](https://github.com/vburel2018/Voicemeeter-SDK)) rather than an
+undocumented local HTTP endpoint, and no write that reports success and then
+does nothing.
 
 **Through Sonar.** In streamer mode Sonar already maintains two separate mixes
 — it calls them monitoring and streaming — for each of Aux, Media, Game, Chat,
@@ -257,7 +270,8 @@ in.
 | | | |
 | --- | --- | --- |
 | [**VB-CABLE**](https://vb-audio.com/Cable/) | donationware | The virtual cables. Needed for per-app channels; not needed if you only want control over the devices you already have. Take the A+B and C+D packs from the same page for five cables in total. |
-| [**SteelSeries Sonar**](https://steelseries.com/gg/sonar) | free | The easiest way to get the two-fader split working, because it keeps both mixes itself — see above. This project exists partly because of Sonar's habit of taking the audio graph down with a Bluetooth headset, and it is still the most convenient answer to the one problem nothing else solves. |
+| [**SteelSeries Sonar**](https://steelseries.com/gg/sonar) | free | The way to get the two-fader split working **today**, because it keeps both mixes itself and mdxmixer already drives it — see above. This project exists partly because of Sonar's habit of taking the audio graph down with a Bluetooth headset, which is worth knowing before you lean on it. |
+| [**Voicemeeter Potato**](https://vb-audio.com/Voicemeeter/potato.htm) | donationware | Same people as the cables, same donation. Its `GainLayer` is a per-strip, per-bus gain, which is the two-fader model by another name — **Potato specifically**, as Standard and Banana do not have it. Not driven by mdxmixer yet, and the better target of the two: a documented C API instead of an undocumented HTTP endpoint. |
 | [**MDropDX12**](https://github.com/shanevbg/MDropDX12) | free | The MilkDrop-style music visualiser this grew up alongside, and the thing most likely to be on the other end of the streaming mix. From **3.3** it reads that mix straight out of the shared-memory ring, so it needs no cable, no recording software and no extra audio device. It also drives this mixer over the pipe rather than touching Windows audio itself. |
 | [**OBS Studio**](https://obsproject.com/) | free | Only if you actually record. It wants the streaming **cable**, not the ring — nothing reads the ring but MDropDX12 today, though an OBS plugin for it would be straightforward if anyone wanted one. Worth saying plainly: feeding a recorder everything you listen to is usually the wrong default, because most of it is other people's music. |
 

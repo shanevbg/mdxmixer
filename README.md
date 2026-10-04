@@ -65,83 +65,56 @@ you flinch.
 
 Here they are simply two numbers.
 
-### Where the second number actually comes from
+### What you need for the second fader to go somewhere
 
-Worth being straight about, because the answer is probably Sonar.
+**The two faders are mdxmixer's own.** It is a mixer: one source in, an EQ,
+two gain stages, two sums. You do not need Sonar, you do not need Voicemeeter,
+and you do not need to buy anything.
 
-Not much does this. Windows gives you one level per app, and the per-app
-mixers give you a nicer version of one level per app — one number, however
-many places the sound is going.
+A channel needs a **source**. If you want the streaming half to reach anyone,
+it also needs a **destination**. Each is a single choice, and each has a free
+answer — pick one row from each group, not all of them:
 
-Two things have it properly:
-
-- **[SteelSeries Sonar](https://steelseries.com/gg/sonar)**, free, in streamer
-  mode. This is what most people with it are already using, and what mdxmixer
-  drives today.
-- **[Voicemeeter Potato](https://vb-audio.com/Voicemeeter/potato.htm)**, from
-  the people who make the cables. Its `GainLayer` is a per-strip, per-bus gain
-  — one input, an independent level for every output bus — which is the same
-  idea under a different name.
-
-  Note **Potato specifically.** Voicemeeter, Voicemeeter Banana and Voicemeeter
-  Potato are three separate products, not tiers of one download, and Potato is
-  the dearest. The cheaper two give one gain per strip plus per-bus masters,
-  which is one number per channel however many places it goes — not this. So
-  the cost of the two-fader model here is a real consideration, not a
-  rounding error against the cables.
-
-mdxmixer does not drive Voicemeeter yet. It is the better of the two targets
-on paper — a documented C API (`VoicemeeterRemote.dll`, with an official
-[SDK](https://github.com/vburel2018/Voicemeeter-SDK)) rather than an
-undocumented local HTTP endpoint, and no write that reports success and then
-does nothing.
-
-**Through Sonar.** In streamer mode Sonar already maintains two separate mixes
-— it calls them monitoring and streaming — for each of Aux, Media, Game, Chat,
-Mic and Master. That is the same two-knob model, and it is the one doing the
-work on a typical setup. mdxmixer shows those channels as ordinary rows and
-drives both of Sonar's levels for you, which it has to do over Sonar's own
-local API: Sonar's virtual devices will accept a Windows volume change, report
-success, and quietly ignore it. **If you have Sonar, this is what you are
-using, and it works today with no cables at all.**
-
-**Through mdxmixer's own channels**, the split happens in its mixer instead —
-one source, two gain stages, two sums. The personal sum goes to your
-headphones. The streaming sum needs somewhere to go, and there are two places
-it can:
-
-- **A streaming cable.** Set one on the Devices tab and your recorder captures
-  that cable, like any other input. This is the ordinary route.
-- **The shared-memory ring**, for a program that wants the audio rather than a
-  device. A client asks for it with `MDXM_FEED|1` and reads
-  `Local\mdxmixer_stream_v1`; no cable, no driver, nothing to install. It is
-  **off until something asks**, because when Sonar is working it is already
-  mixing this audio and two live sources of it work against each other.
-  Right now **MDropDX12 3.3+ is the only thing that reads it**, and that path
-  is new enough to still want testing.
-
-  This is the common case in practice, and it is worth being clear why: a
-  visualiser wants to *see* your music, which is a different thing from a
-  recorder wanting to *keep* it. Most of what comes out of these faders is
-  other people's media, and sending it all to a recording by default would be
-  the wrong instinct. An OBS plugin that read the ring would be easy enough
-  to write — nobody has needed one.
-
-If neither is set up, the streaming sum is computed and thrown away, so the
-`[S]` fader on a native channel moves nothing anybody can hear. That is a
-setting, not a limitation, but it is the step people miss.
-
-So, in short:
-
-| you have | the `[P]` fader | the `[S]` fader |
+| | pick one | cost |
 | --- | --- | --- |
-| Sonar | works | works — Sonar keeps both mixes |
-| a streaming cable | works | works — your recorder captures the cable |
-| a feed subscriber | works | works — mdx12 3.3+ reads the ring |
-| none of those | works | moves nothing |
+| **source** | the free [VB-CABLE](https://vb-audio.com/Cable/) — one cable, one separated app | free |
+| | **or** loopback of a render endpoint you already have | free, no cable |
+| **destination** | the **shared-memory ring**, read by [MDropDX12](https://github.com/shanevbg/MDropDX12) | free, no cable |
+| | **or** a second cable, if a recorder needs to see a device | the A+B pack |
 
-The quiet-for-you half works in every row, because that is just your output
-level, and it is the half that matters most of the time.
+So the free configuration is real: one cable, one app on its own channel with
+an independent level for your ears and for everything downstream, and the
+streaming side delivered through shared memory with no second cable and no
+driver. Point a channel at a render endpoint instead and you do not even need
+the one cable.
+
+The personal fader always works regardless — that is just your output level,
+and it needs nothing at all.
+
+> **The one trap.** If you set up neither destination, the streaming sum is
+> computed and thrown away, so an `[S]` fader will move and change nothing
+> anybody can hear. It is not broken and it is not a limitation; it is a
+> setting nobody has filled in, and it is the step people miss.
+
+### Where Sonar or Voicemeeter fit in — optional, either, neither
+
+Relevant only if you already run one of them and want **its** channels driven
+from here rather than from its own window. Neither adds a fader mdxmixer does
+not already have.
+
+- **[SteelSeries Sonar](https://steelseries.com/gg/sonar)**, free. In streamer
+  mode it keeps two mixes of its own — monitoring and streaming — for Aux,
+  Media, Game, Chat, Mic and Master. mdxmixer shows those as ordinary rows and
+  drives both levels, which it has to do over Sonar's own local API because
+  Sonar's virtual devices accept a Windows volume change, report success, and
+  quietly ignore it. Useful because it covers channels mdxmixer did not
+  create; not a prerequisite for anything.
+- **[Voicemeeter Potato](https://vb-audio.com/Voicemeeter/potato.htm)**, not
+  driven yet (#6). Its `GainLayer` is a per-strip, per-bus gain — the same
+  idea again. **Potato specifically**: Voicemeeter, Banana and Potato are
+  three separate products at three prices and only the dearest has it. That
+  makes it a poor way to *obtain* two faders when mdxmixer already gives you
+  them free, and a reasonable thing to support for people already running it.
 
 ---
 
@@ -160,15 +133,15 @@ are welcome"* — and that gets you exactly **one** cable. The **A+B** and
 **C+D** packs are four more, and those come with a donation: *"Click on Donate
 button below to get your personal download link!"*
 
-One cable is further than it sounds, because it only has to carry the thing
-that genuinely needs a device:
+One cable goes further than it sounds, because it only has to carry the one
+thing that genuinely needs a device. Spend it on whichever you want:
 
-- **One app channel**, and everything else stays on your normal output.
-- **Or** a streaming output for a recorder.
-- **And the visualiser needs no cable at all** — `MDXM_FEED` hands the
-  streaming mix to MDropDX12 through shared memory, so if that is where your
-  second fader was going, the free cable is free to be used for something
-  else.
+- **one app channel**, with everything else staying on your normal output; or
+- **one streaming output** for a recorder.
+
+A visualiser needs no cable for either — `MDXM_FEED` hands MDropDX12 the
+streaming mix through shared memory, so if that was where your second fader
+was going, the free cable is still yours to spend on the app channel.
 
 Set every cable to **24-bit, 48000 Hz** on both its playback and recording
 sides in `mmsys.cpl` — mismatched rates are the one setup mistake that

@@ -74,6 +74,15 @@ below exists.
 | `svol` `smute` | the Streaming fader — what goes out |
 | `eq` | `1` when the channel's EQ is enabled |
 | `peak` | what the channel's **source** is carrying, `0..1`, or `-1` — see §2.1 |
+| `idle` | `1` when the channel is not capturing because **nothing is pulling the mix** |
+
+> **`idle=1` is not a fault.** mdxmixer captures on demand: with no personal
+> render, no streaming cable and no feed subscriber, nothing is consuming the
+> mix, so no cable is opened and no ring is run. Such a channel reports
+> `health=ok` — its cable has not been touched, so nothing is known to be wrong
+> with it — and `peak=-1`, because nothing is being measured. It starts
+> capturing again, from an empty ring, the moment anything listens. A client
+> showing channel state should treat `idle=1` as "resting", never as "broken".
 
 **`MDXM_ROUTE|id=personal|device=<endpointId>`** — where a route is actually
 playing right now. Read this rather than the configured output: failover may
@@ -116,9 +125,62 @@ recomputing anything:
 > `MDXM_FAILOVER` already applies that rule for you (§4).
 
 ### `MDXM_DIAG`
-→ framed. `MDXM_RING` per ring buffer (fill, overruns, underruns) and
-`MDXM_DIAGDEV` with the live personal device and whether it is on a fallback.
+→ framed. `MDXM_RING` per ring buffer, `MDXM_DIAGDEV` with the live personal
+device and whether it is on a fallback, and `MDXM_DIAGMIX` with the latency.
 For troubleshooting, not for driving a UI.
+
+```text
+MDXM_RING|id=sonar|depth=840|cap=24000|drops=0|underruns=0|speed=1.0000
+```
+
+| key | meaning |
+|---|---|
+| `depth` | frames currently in the ring — **read it against `cap`, never alone** |
+| `cap` | the ring's capacity, 500 ms at the mix rate; it bounds the worst a stall can leave behind |
+| `drops` | frames discarded because the ring was full — the producer outran the consumer |
+| `underruns` | times the mix found the ring empty |
+| `speed` | the varispeed trim: `> 1` draining, `< 1` refilling, exactly `1.0000` left alone |
+
+> **A depth means nothing on its own.** A 1.99-second backlog was once
+> diagnosed from `depth=95520` only because the ring was known from the source
+> to hold 96000 frames; the same figure against a larger ring is an ordinary
+> fill. Sampling twice a minute apart is what proves a backlog is *stuck*.
+
+> **`depth` and `speed` are not sampled at the same instant, so do not check
+> one against the other.** `depth` is read when you ask; `speed` is what the
+> engine's one-second tick last decided, from the depth as it was then. The
+> depth moves by a whole render pull between callbacks — 480 frames is normal —
+> so a line reading `depth=1671|speed=0.9982` is perfectly consistent: the trim
+> saw about 1157 a moment earlier and is topping the ring up. Neither figure is
+> stale; they are answers to "how deep is it *now*" and "what is being done
+> about it".
+
+`speed` is published because the correction is inaudible by design — a few
+hundredths of a percent for ordinary clock drift, up to ±5% at the extremes —
+and a silent change to playback speed that cannot be observed from outside the
+process is indistinguishable from a bug. Anything other than `1.0000` means the
+engine has noticed and is already giving the latency back; the `stream` and
+`mic` rings always report `1.0000`, because only channel captures have a second
+hardware clock to drift against.
+
+```text
+MDXM_DIAGMIX|rate=48000|cushion=4800|cushionms=100|window=2880|peak=9600
+```
+
+| key | meaning |
+|---|---|
+| `rate` | the mix rate, to read the frame counts with |
+| `cushion` | frames the mix waits for before draining a channel — **this is the latency** |
+| `cushionms` | the same figure in milliseconds, for convenience |
+| `window` | the largest pull in the **last 60 seconds**, which is what sizes the cushion |
+| `peak` | the largest pull ever seen in this engine run; sizes nothing |
+
+The cushion adapts to the biggest buffer the render has asked for, because a
+pull larger than the cushion is an underrun. It is sized from the **rolling**
+maximum: a monotonic high-water mark meant one oversized pull — a Bluetooth
+hiccup, a device change, a stall — raised the latency for the rest of the
+session with no way back down short of a restart. `window` falling below `peak`
+is the normal, healthy picture.
 
 ---
 
@@ -231,12 +293,20 @@ All of these reply `MDXM_OK`, or a channel echo where noted, or `MDXM_ERR`.
 | `MDXM_DEVVOL\|<endpointId>\|<0..1>` | an endpoint's own Windows volume |
 | `MDXM_DEVMUTE\|<endpointId>\|<0\|1>` | an endpoint's own mute |
 | `MDXM_NAME\|<endpointId>\|<alias>` | our name for a device; empty clears it |
+| `MDXM_HIDE\|<endpointId>\|<0\|1>` | file a device out of the list → echoes `MDXM_DEVLVL` |
+| `MDXM_PIN\|<endpointId>\|<0\|1>` | hold a device at the top → echoes `MDXM_DEVLVL` |
 | `MDXM_ROUTE_SET\|personal\|<endpointId>` | bind the personal output |
 | `MDXM_DEFAULT\|<endpointId>` | move the **Windows** default output |
 | `MDXM_ASSIGN\|<exePath>\|<ch or ->` | send one app to a channel |
 | `MDXM_APPROUTE\|<exePath>\|<endpointId>` | send one app straight to an endpoint |
+| `MDXM_CUSHION\|<ms>` | the mix cushion floor — **the latency** → echoes `MDXM_CUSHIONSTATE` |
 | `MDXM_SHOW` / `MDXM_HOTKEYS` | raise a window |
+| `MDXM_TAB\|<mixer\|routing\|eq\|devices\|vban\|options>` | bring one tab of the main window to the front |
+| `MDXM_CAPTURE\|<pngPath>\|[main\|hotkeys\|overlay]` | write a PNG of one window as it stands |
 | `MDXM_EXIT` | shut down through the real exit path |
+| `MDXM_VBAN\|<key>=<value>\|…` | the network stream — see §11 → echoes `MDXM_VBANSTATE` |
+| `MDXM_VBANPEERS` | who is subscribed to the network stream → `MDXM_VBANPEER` rows |
+| `MDXM_AUTH\|pin=\|device=\|name=` | **VBAN-only**; on this pipe it answers `MDXM_ERR` — see §11 |
 
 Writes are **optimistic**: the echo carries the value you asked for. The
 subscription (§7) carries what actually happened.
@@ -252,6 +322,138 @@ subscription (§7) carries what actually happened.
 system default that every *other* application follows. It can fail silently
 in one known way — SteelSeries Sonar re-asserts itself as the default within
 moments — so the reply reports what the default actually is afterwards.
+
+### `MDXM_CUSHION` — the latency, live
+
+```
+MDXM_CUSHION                      → MDXM_CUSHIONSTATE|ms=30|headroom=50|flat=10
+MDXM_CUSHION|12                   → the floor, in ms (clamped 5..200)
+MDXM_CUSHION|flat=0               → one adaptive term, the others untouched
+MDXM_CUSHION|8|headroom=100|flat=3  → all three at once
+```
+
+The cushion is what the mix waits for before it starts draining a channel, so
+it **is** the latency. It is computed as:
+
+```text
+cushion = max( floor , pull + pull × headroom% + flat )
+```
+
+where `pull` is the largest the render has asked for in the last 60 seconds
+(see `MDXM_DIAG`). So the floor is only a floor — once it is out of the way the
+adaptive terms govern, and those are what actually set the latency on a healthy
+link. Measured here: a WF-1000XM5 pulls 480 frames (10 ms), so the defaults of
+50% and 10 ms give a 25 ms cushion no matter how low the floor goes.
+
+| term | what it defends against |
+|---|---|
+| `headroom` | a pull that grows — proportional slack |
+| `flat` | scheduling jitter, which does not scale with buffer size |
+| floor (`ms`) | nothing in particular; a hard minimum you choose |
+
+**The reply says what was applied, not what you asked for.** That matters for
+the only sensible way to use this: lower it, watch `underruns` in `MDXM_DIAG`,
+and keep going until they appear.
+
+It is a verb rather than a config-file setting alone because finding the right
+value is an experiment, and a restart would reset the very counter being
+watched. The value is persisted as well, so a good number survives.
+
+> **Setting it re-cushions the running channels.** Each one clears its ring and
+> refills, so there is a gap of the new cushion's length — tens of
+> milliseconds. That is the honest price of changing the latency of a graph
+> that is already running, and it is why this is a deliberate command rather
+> than something applied on a timer.
+
+### `MDXM_HIDE` and `MDXM_PIN` — how the user has filed a device
+
+`MDXM_DEVLVL` reports `hidden` and `pinned`; these set them. Windows publishes
+far more endpoints than anyone mixes with — five headsets' hands-free twins,
+every virtual Sonar device — so a list that cannot be cut down is a list
+nobody reads.
+
+```
+MDXM_HIDE|{0.0.0.00000000}.{cc8e…}|1   → MDXM_DEVLVL|…|hidden=1|pinned=0|…
+MDXM_PIN|{0.0.0.00000000}.{cc8e…}|1    → MDXM_DEVLVL|…|hidden=0|pinned=1|…
+```
+
+- **They echo the row**, not `MDXM_OK`, so the new state needs no second round
+  trip — the way `MDXM_SET` echoes `MDXM_CHAN`.
+- **The flags are mutually exclusive.** A device cannot be held at the top of
+  a list and absent from it, so setting either to `1` clears the other.
+  Clearing one says nothing about the other: unpinning a visible device does
+  not hide it.
+- **The id is enough.** The ContainerId and Windows name that let the flag
+  survive the device returning under a new endpoint id are looked up here, as
+  `MDXM_NAME` does it.
+- **It goes both ways.** The same store backs mdxmixer's own right-click Hide
+  and Pin, so a flag set over this pipe files the device away in mdxmixer's
+  window immediately, and one set in that window reaches every subscriber as
+  an `MDXM_DEVLVL` push (§7). There is one copy of this state and both
+  surfaces drive it through one path.
+- **A device in use is not refused.** Hiding the endpoint the personal mix is
+  playing to does nothing to the audio — it is a view. (The Mixer tab hoists
+  the live personal route to the top regardless, because that row is the
+  answer to "where am I listening".) The one write mdxmixer does refuse is
+  `MDXM_MUTE` on `sonar:masters`, and that is because it would do harm.
+
+### `MDXM_TAB` — the counterpart of `MDXM_SHOW`
+
+`MDXM_SHOW` raises the window; this says *which part of it* to raise.
+
+```
+MDXM_TAB|devices        → MDXM_OK
+MDXM_TAB|3              → MDXM_ERR|msg=unknown tab: 3
+```
+
+**By name, never by index.** An index is a thing that silently means a
+different tab the day one is inserted — which has now happened once: `vban` was
+added before `options`. The six names are `mixer`, `routing`, `eq`, `devices`,
+`vban` and `options`, matched case-insensitively; anything else is an
+error rather than a guess. It does not raise the window on its own — send
+`MDXM_SHOW` as well if the window may be in the tray.
+
+### `MDXM_CAPTURE` — a picture of a window, from inside the process
+
+```
+MDXM_CAPTURE|C:\shots\mixer.png                  → MDXM_OK
+MDXM_CAPTURE|C:\shots\overlay.png|overlay        → MDXM_OK
+MDXM_CAPTURE|C:\shots\x.png|desktop              → MDXM_ERR
+```
+
+The second field names the window and defaults to `main`:
+
+| value | window |
+|---|---|
+| `main` | the mixer window |
+| `hotkeys` | the hotkey assignment window, when it is open |
+| `overlay` | the battery readout |
+
+It exists so documentation screenshots can be **regenerated** rather than
+grabbed by hand once and left to rot as the window changes — the same reason
+MDropDX12 carries `CAPTURE_WINDOW=`, and worth repeating here: a capture taken
+from *inside* the process renders owner-drawn controls, where `PrintWindow`
+from another process does not. mdxmixer's faders, meters and rows are all
+owner-drawn. `overlay` has no other route at all: it is frameless,
+click-through and always on top, so no window picker can select it and the
+only alternative is a full-desktop grab that publishes whatever else is on
+screen.
+
+**This verb creates a file on disk at a path you choose**, so its constraints
+are worth stating rather than discovering:
+
+- The path is used exactly as given. Pass an **absolute** path — a relative
+  one resolves against mdxmixer's working directory, which is wherever it
+  happened to be started from.
+- The **directory must already exist**. Nothing is created for you; a bad
+  directory is `MDXM_ERR`, not a silent miss.
+- An existing file is **overwritten** without asking.
+- It is written with mdxmixer's own privileges, as the user running it.
+- The **client area** is captured, not the frame, and at the window's current
+  size. A window that is not open — `hotkeys` when the window is closed —
+  is an error rather than an empty image.
+- The window need **not** be in front. It does have to exist: `main` is
+  created at startup, so it is always capturable, in the tray or not.
 
 ---
 
@@ -286,6 +488,53 @@ MDXM_FOENTRY|i=0|id={0.0.0...}|name=Headphones (WF-1000XM6)|alias=XM6
 
 The first entry that is `present` wins. A commit is permanent: reconnecting
 the old device does not move the route back.
+
+### `MDXM_FOSTATE` — what the watcher is actually doing
+
+The same reply carries one of these. The rule above says what *should*
+happen; this says what *is* happening, so a front-end showing the rule need
+not infer it from the device list.
+
+```
+MDXM_FOSTATE|route=personal|state=searching|current={0.0.0…}|target={0.0.0…}
+            |attempts=3|dwell=40000|since=12000|hold=0|audiodg=34552|restarts=2
+            |reason=attempt 3 did not stick; waiting 40 s before retrying
+```
+
+| key | meaning |
+|---|---|
+| `route` | `personal` — the one route mdxmixer owns today |
+| `state` | `idle` / `searching` / `arming` |
+| `current` | the endpoint the state machine believes the route is on |
+| `target` | the last endpoint it committed to |
+| `attempts` | consecutive commits to the **same** target; `0` or `1` is healthy |
+| `dwell` | ms in force for this route, **after** any back-off |
+| `since` | ms since the last commit, `0` if there has not been one |
+| `hold` | ms of hold remaining; `0` when not held |
+| `audiodg` | AUDIODG.EXE's process id, `0` when it is not running |
+| `restarts` | how many times it has restarted since mdxmixer started |
+| `reason` | free text, and **last** in the record for that reason |
+
+Three of these exist because of one outage (MDropDX12 #410), and they are
+what to read when a route will not settle:
+
+- **`current` disagreeing with `target` is the fault signature.** It means
+  the move was made and something re-baselined the route off it before the
+  next tick, which is how a route comes to re-commit the same move for ever.
+- **`attempts` above 1 means the move is not sticking.** The dwell doubles
+  per consecutive attempt — 10 s, 20, 40, 80, capped — so `dwell` is what is
+  in force now rather than the configured value.
+- **`reason` is the useful output when nothing is happening.** For hours the
+  only readable thing said `idle` with no reason between attempts; it now
+  names the back-off explicitly.
+
+> **`hold` with a fresh `audiodg` pid is not a fault.** When AUDIODG restarts
+> every endpoint reads absent at once, so the watcher deliberately stands down
+> rather than moving routes onto devices that cannot accept them — that is the
+> churn that took the audio engine down in the first place. The hold is a
+> **ceiling**, not a duration: it lifts as soon as AUDIODG has been back and
+> unchanged for a few seconds. Killed cleanly it is back in under a second;
+> about a minute after Sonar's APO faults it. Both measured here.
 
 `gap` exists separately from `dwell` because Sonar mishandles a personal
 stream endpoint that changes too quickly, and `Sonar.APO.dll` runs inside
@@ -371,21 +620,83 @@ Bluetooth address belongs to the headset, which is why it leads.
 mdxmixer pushes records to it unprompted, on the same connection.
 `MDXM_SUBSCRIBE|0` stops it.
 
+### Asking for a different push rate
+
+```text
+MDXM_SUBSCRIBE|1|100      ->  MDXM_OK|intervalMs=100
+```
+
+The optional second argument is **this connection's own push interval in
+milliseconds**, and it applies to that connection alone — one client asking
+for 100 ms does not change what anyone else receives.
+
+- **250 ms is the default**, and what you get if you never ask.
+- **100 ms is the floor.** It is the rate mdxmixer's own window refreshes at,
+  and a push cannot carry anything the endpoint sweep behind it has not yet
+  produced, so asking for less would send you the same numbers twice.
+- **5000 ms is the ceiling**, because a subscription that reports in once a
+  minute is indistinguishable from a dead one.
+- **A rate outside that is clamped, never refused**, and the reply tells you
+  what you actually got. A rate that cannot be read at all falls back to the
+  default rather than failing the subscription.
+- Ask **down**, not just up: a client that only wants to know when a device
+  appears is better served by `MDXM_SUBSCRIBE|1|2000`, and it saves both ends
+  the work of the pushes in between.
+
+Changed records (`MDXM_CHAN`, `MDXM_ROUTE`) are **not** on this clock. They
+arrive when something changes, as they always did; the rate governs the
+tick-driven push below.
+
 Prefer this to polling `MDXM_STATE`. A subscription costs nothing while
 nothing is happening, and a poll fast enough to feel live is a full state
-block many times a second.
+block many times a second. **Read `MDXM_STATE` once on connect for your
+baseline, then subscribe** — the push is how state stays current, not how it
+starts.
 
-Two kinds of push arrive, and the difference matters:
+Three kinds of push arrive, and the difference matters:
 
 | | when | what it means |
 | --- | --- | --- |
 | `MDXM_CHAN`, `MDXM_ROUTE` | something **changed** | a fader moved, a route switched, Sonar came back |
-| `MDXM_PEAK` | every **250 ms** | nothing changed; the levels moved |
+| `MDXM_DEVSET`, `MDXM_DEVLVL` | a device row **changed** | a volume, a mute, a battery, a hide, a device arriving or going |
+| `MDXM_PEAK` | every **push interval** (250 ms unless you asked for another) | nothing changed; the levels moved |
 
 Kept apart on purpose. Peaks move constantly and change nothing, so carrying
 them on `MDXM_CHAN` would mean re-reading every fader position you already
 know four times a second — and you could no longer tell a push that means
 "someone moved a fader" from one that means "the music got louder".
+
+### `MDXM_DEVSET` and the device rows
+
+```text
+MDXM_DEVSET|dev={0.0.0.00000000}.{cc8e…}|dev={0.0.0.00000000}.{3090…}|…
+MDXM_DEVLVL|id={0.0.0.00000000}.{cc8e…}|…|vol=0.35|mute=0|active=1|…
+```
+
+A changed endpoint arrives as its own `MDXM_DEVLVL` — the identical record
+`MDXM_STATE` would have given you, from the same formatter. Fields follow §2
+exactly.
+
+- **`MDXM_DEVSET` means rebuild.** It carries every endpoint id, in
+  mdxmixer's own sort order, and arrives when the **set** of rows or their
+  order changes — a headset switching on, one going away, a pin moving a row.
+  Every row follows it. A client holding a control per device rebuilds its
+  controls on this record and updates values otherwise.
+- **It is the only way a removal can reach you.** A device that has gone has
+  no row to push, so nothing else would say it had gone.
+- **A row is sent only when something about it changed**, `peak` excluded —
+  that one moves constantly and travels on `MDXM_PEAK` below. So a quiet
+  machine with a subscriber sends one `MDXM_PEAK` per push interval and
+  nothing else.
+- **`seen` is minute resolution**, so a sighting a few seconds later is not a
+  change and does not push.
+- **Only while someone is subscribed**, like `MDXM_PEAK`: the endpoint sweep
+  these come from is the one the peaks already pay for.
+
+The latency is one 250 ms tick rather than instant, because that sweep is the
+only thing on the machine that observes most of these changes — Windows does
+not tell mdxmixer when a volume slider moves, a battery falls, or an endpoint
+goes inactive. The sweep is the event.
 
 ### `MDXM_PEAK`
 
@@ -538,3 +849,148 @@ Send 'MDXM_FAILOVER_LIST|dev={0.0.0.00000000}.{6d9c95fa-…}~Headphones (3- WF-1
 Connecting fails, which is the signal. A front-end should fall back to its
 own path and retry the connection rather than queueing — there is no state to
 hand over, and mdxmixer reads its own config at startup.
+
+## 11. The network stream (VBAN)
+
+mdxmixer can put the **monitor mix** on the network as a standards-compliant
+[VBAN](https://vb-audio.com/Voicemeeter/vban.htm) stream, so a phone — or any
+VBAN receiver on the LAN — can listen to what the headphones are hearing. The
+design is `docs/specs/2026-10-07-vban-stream-server-design.md`; this section is
+the wire surface.
+
+Two things are deliberately separate:
+
+- **The listener** is up whenever `on=1`, and that setting persists. The point
+  of the feature is that a phone can subscribe at any moment without anyone
+  touching the PC.
+- **Emission** is on demand. Nothing leaves this machine until a peer has
+  asked, by sending a VBAN `SERVICE`/PING0 packet to the port below; the stream
+  stops when the last one stops asking. `emitting` says which state it is in.
+
+Default port is **6980**, the VBAN default.
+
+### `MDXM_VBAN` — set or query
+
+The first **keyed-argument** verb in this protocol: every other verb above is
+positional, this one takes `key=value` fields and applies them in order. With no
+fields it is a query. Either way the reply is the whole state, so a caller never
+needs a second round trip to find out what its write produced.
+
+| key | values | notes |
+| --- | --- | --- |
+| `on` | `0`\|`1` | the listener socket; **persists** |
+| `port` | 1..65535 | rebinds |
+| `name` | 1..16 chars | the VBAN stream name; 16 is the field width on the wire |
+| `source` | `personal`\|`streaming` | **`personal` is the monitor mix** — what the headphones get, per-channel balance and personal mutes included. `streaming` is the programme mix, which is a different thing. |
+| `format` | `i16`\|`f32` | `i16` is half the bandwidth and what every receiver accepts |
+| `gain` | 0..6400 (percent) | applied PC-side **before** the wire. It reaches 6400 because the personal mix on this machine runs at a few percent of full scale — the faders are the listening level — so sending it unamplified would put a 20–40 dB-down signal into a phone. |
+| `fps` | 0.2..10 | display-capture rate |
+| `open` | `0`\|`1` | `openSubscribe`: any pinger gets **audio and nothing else**. For standard VBAN tools, which cannot authenticate because the protocol has no notion of it. |
+| `always` | `0`\|`1` | emit with no subscriber at all, to `target` |
+| `alwaysframes` | `0`\|`1` | …and send display frames too |
+| `target` | `ip:port` | empty, or unparseable, means inert — the reason appears in `error` |
+| `pin` | any | **pipe-only.** Setting the secret over the channel it protects is circular, so this key is refused over VBAN-TXT. |
+
+Two keys are **VBAN-only** and answer `MDXM_ERR` here, because they are grants
+to one *peer* and the pipe is not a peer:
+
+```text
+MDXM_VBAN|frames=1   ->  MDXM_ERR|msg=frames is VBAN-only
+MDXM_VBAN|audio=0    ->  MDXM_ERR|msg=audio is VBAN-only
+```
+
+Fields are applied in order; a rejected value stops processing there and the
+reply names the key that failed. Fields **before** it in the same record have
+already been applied, so the recovery is to re-send the whole record — every
+set is an absolute value, so re-applying the ones that already took changes
+nothing. (In practice the tab and the phone send one field per record, so a
+record that half-applies is the exception, not the rule.)
+
+### `MDXM_VBANSTATE` — the reply
+
+```text
+MDXM_VBANSTATE|on=1|emitting=1|port=6980|name=mdxmixer|peers=1|source=personal
+  |format=i16|gain=100|fps=2|open=0|always=0|alwaysframes=0|target=
+  |sent=18412|starved=0|dropped=0|depthms=120|behindms=0|srclatencyms=37
+  |framessent=0|authpending=0|error=
+```
+
+The three latency numbers answer three different questions and are easy to
+confuse:
+
+- **`depthms`** is how far ahead the **producer** is. A Bluetooth render pulls
+  seconds beyond what its own radio has played, so a large depth here is normal
+  and is *not* delay the sender can remove.
+- **`behindms`** is the sender falling behind its own schedule. This one **is**
+  this machine or the network failing to keep up.
+- **`srclatencyms`** is the PC's own contribution to what the listener hears
+  late — the mix cushion plus a packet. A receiver adds its own jitter buffer
+  and output latency to it and can then show a figure somebody can type into a
+  video player's audio-delay box.
+
+`starved` counts packets the sender had to fill with silence because the ring
+was empty; `dropped` is the ring's own overflow count, which is the opposite
+problem. `error` is free text and is **last**, for the reason `MDXM_FOSTATE`'s
+`reason` is last.
+
+### `MDXM_VBANPEERS`
+
+```text
+MDXM_BEGIN
+MDXM_VBANPEER|addr=192.168.0.77:50001|device=Pixel 9|authed=1|since=1200|audio=1|frames=0|always=0
+MDXM_END
+```
+
+`always=1` marks the configured always-stream target, which is **not** a
+subscriber: it never pings, holds no table slot and is not counted in `peers` —
+but something is being sent to it, so it has a row.
+
+### `MDXM_AUTH` — VBAN-only
+
+```text
+MDXM_AUTH|pin=<pin>|device=<id>|name=<label>   ->  MDXM_ERR|msg=auth is VBAN-only
+```
+
+Authentication exists for the **network** side, where the transport has no ACL
+of its own. It mirrors MDropDX12's model: a PIN plus a per-device approval
+prompt on the PC, after which that device reconnects without asking again. This
+pipe is already ACL'd to the interactive user and needs none of it.
+
+### Over VBAN-TXT
+
+Records travel as VBAN `TXT` packets, UTF-8, carrying the **same grammar** this
+document describes — so a client that can already speak to the pipe needs no
+second dialect. What differs:
+
+- Every record must carry the configured **stream name**, or it is dropped: a
+  record addressed to something else on the network is not ours to act on.
+- **With no PIN configured, all of it is dropped** — `MDXM_AUTH` included. There
+  is then no way to authenticate, so the remembered devices are inert too. This
+  is "serve, but take no orders", and it is the default.
+- A sender must authenticate before anything but `MDXM_AUTH` is answered.
+  Unauthenticated records are dropped in silence.
+- A single record never spans packets. Multi-record replies (`MDXM_BEGIN` …
+  `MDXM_END`) span several, always splitting *between* records.
+- `MDXM_SUBSCRIBE` is refused (`MDXM_ERR|msg=subscribe is pipe-only`): every
+  broadcast site is wired to the pipe and the push direction has no
+  transport-independent seam yet. Poll `MDXM_VBANSTATE` instead.
+- `MDXM_VBAN|pin=` is refused (`MDXM_ERR|msg=pin is pipe-only`).
+- `audio=0|1` and `frames=0|1` are **only** meaningful here, and apply to the
+  sending peer: `audio=0` keeps a control session without the stream, which is
+  what a phone sends when the user closes the player but keeps the mixer on
+  screen.
+
+`MDXM_AUTH` answers one of:
+
+```text
+MDXM_AUTHSTATE|ok=1                  authorised; the surface is open
+MDXM_AUTHSTATE|pending=1             right PIN, unknown device: the PC has been asked
+MDXM_AUTHSTATE|ok=0|err=badpin       wrong PIN (three strikes locks the address out)
+MDXM_AUTHSTATE|ok=0|err=locked       too many wrong PINs from this address; wait 60 s
+MDXM_AUTHSTATE|ok=0|err=denied       the person at the PC said no; terminal until restart
+MDXM_AUTHSTATE|ok=0|err=nodevice     no device id in the request
+```
+
+A client that gets `pending=1` should keep sending `MDXM_AUTH` while it waits —
+the PC is only prompted once per device, so re-sending costs nothing. `denied`
+and `locked` are terminal: stop, and tell the user why.

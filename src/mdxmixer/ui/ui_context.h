@@ -37,12 +37,34 @@ struct UiContext {
     std::function<void()> onSuspend;
     std::function<void()> onResume;
     std::function<void()> onDeviceChangeDebounced;  // app layer: engine OnDeviceSetChanged
+    // An app started playing (fj#1). Windows' per-app routing is keyed by
+    // process id, so a stored assignment can only be written while the app is
+    // running -- this is the moment it becomes writable, and before it existed
+    // an app launched while mdxmixer sat in the tray kept whatever route
+    // Windows already had for it.
+    std::function<void()> onSessionsChangedDebounced;
     // IPC requests are marshaled onto the UI thread (SendMessage from the pipe
     // client thread), so config + engine control stays single-threaded.
-    std::function<std::vector<std::wstring>(const std::wstring& msg, bool* wantSubscribe)> dispatchIpc;
+    std::function<std::vector<std::wstring>(const std::wstring& msg, bool* wantSubscribe,
+                                            int* wantIntervalMs)> dispatchIpc;
     // Theme: the live state (colors + brushes) and the mode setter ("dark"/"light"/"system").
     std::function<const ThemeState*()> theme;
     std::function<void(const std::wstring&)> setTheme;
+    // A VBAN device with the right PIN that has never been approved: ask the
+    // person at the PC. Called on the UI thread (the receive thread only posts),
+    // so this may show a dialog.
+    std::function<void(const std::wstring& deviceId, const std::wstring& name)> vbanAuthRequested;
+    // What the person said. Called from the dialog's own handler on the UI thread.
+    std::function<void(const std::wstring& deviceId, bool allow)> vbanAuthResult;
+    // The person dismissed the prompt without answering (Esc, close, or the
+    // dialog failed to open). NOT a denial: the device stays able to ask again.
+    std::function<void(const std::wstring& deviceId)> vbanAuthDismissed;
+    // Apply a VBAN config change that rebinds the socket, deferred off the
+    // handler that requested it (see MainWindow::kVbanApplyMsg).
+    std::function<void()> vbanApply;
+    // One that has just been authorized, so it can be remembered and the next
+    // connection is instant.
+    std::function<void(const std::wstring& deviceId, const std::wstring& name)> vbanDeviceAuthorized;
     // False when the undocumented per-app routing API did not resolve on this
     // Windows build. The spec's posture is "assignment features degrade and say
     // so" — the Routing tab has to be able to say it.

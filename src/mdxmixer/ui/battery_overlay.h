@@ -66,6 +66,17 @@ public:
     void BeginInteractiveMove();
     bool Moving() const { return m_moving; }
 
+    // Compensate for being read through MDropDX12's watermark.
+    //
+    // A RUNTIME state, never written to config: the stored opacity is what
+    // the user chose, and it has to come back unchanged the moment the
+    // watermark goes away. Re-applies the styles only when the answer
+    // actually changes, because this is asked once a second for ever.
+    //
+    // See BoostedOpacityUnderWatermark in ui/topmost.h for the arithmetic and
+    // for why it only applies between 40 and 80 percent.
+    void SetUnderWatermark(bool under);
+
 private:
     void ApplyStyles();
     void Resize();
@@ -89,6 +100,7 @@ private:
     std::vector<int> m_levels;     // parallel to m_lines; drives the colour
     std::function<void(int, int, int)> m_onGeometry;
     bool m_moving = false;      // transient: see BeginInteractiveMove
+    bool m_underWatermark = false;   // transient: see SetUnderWatermark
     bool m_sizing = false;      // inside a move/resize gesture
     SIZE m_sizeAtGestureStart = {};
 };

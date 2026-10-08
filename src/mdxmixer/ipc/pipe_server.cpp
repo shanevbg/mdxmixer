@@ -1,6 +1,8 @@
 #include "pipe_server.h"
 #include "app/thread_guard.h"
+#include "ipc/protocol.h"   // kPushIntervalDefaultMs — the rate a subscriber gets unasked
 #include <windows.h>
+#include <sddl.h>
 #include <process.h>
 #include <atomic>
 #include <mutex>
@@ -20,6 +22,52 @@ constexpr DWORD kBufBytes = 64 * 1024;
 // MsgWaitForMultipleObjectsEx lets the system deliver the sent message while we
 // wait, so the handler returns and the thread can finish.
 // Returns true when the thread ended, false on timeout.
+// The pipe's security, and it is load-bearing from the moment mdxmixer runs
+// elevated.
+//
+// A named pipe created with null attributes takes the CREATOR's integrity
+// level. Elevated, that is High -- and Windows' no-write-up rule then stops
+// every ordinary process from writing to it. MDropDX12, the `mdxmixer` refresh
+// tool and anything else driving this program all run at Medium, so the entire
+// control surface would go quiet the moment elevation was turned on, with
+// "access denied" on connect and nothing in the log to explain it.
+//
+// So the label is set explicitly to Medium, which is where the clients live,
+// and the DACL names who may use it rather than relying on a default that
+// changes with the token:
+//
+//   SY  Local System          all access
+//   BA  Built-in Administrators   all access
+//   IU  Interactive Users      all access -- the person at the keyboard, which
+//                              is who every client of this pipe belongs to
+//   ML  Medium, no-write-up    a process below Medium cannot write to it
+//
+// Deliberately NOT a null DACL: that reads as "no restrictions" and grants
+// everyone everything, which is the opposite of what an elevated server wants.
+constexpr wchar_t kPipeSddl[] =
+    L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)S:(ML;;NW;;;ME)";
+
+// Builds the descriptor once; the caller passes the result to every
+// CreateNamedPipe. Null on failure, which falls back to default security --
+// correct for an unelevated build and merely restrictive for an elevated one.
+class PipeSecurity {
+public:
+    PipeSecurity() {
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                kPipeSddl, SDDL_REVISION_1, &m_sd, nullptr))
+            m_sd = nullptr;
+        m_sa.nLength = sizeof(m_sa);
+        m_sa.lpSecurityDescriptor = m_sd;
+        m_sa.bInheritHandle = FALSE;
+    }
+    ~PipeSecurity() { if (m_sd) LocalFree(m_sd); }
+    SECURITY_ATTRIBUTES* Get() { return m_sd ? &m_sa : nullptr; }
+
+private:
+    PSECURITY_DESCRIPTOR m_sd = nullptr;
+    SECURITY_ATTRIBUTES m_sa{};
+};
+
 bool WaitThreadPumping(HANDLE thread, DWORD timeoutMs) {
     ULONGLONG deadline = GetTickCount64() + timeoutMs;
     for (;;) {
@@ -44,6 +92,14 @@ struct PipeClientContext {
     std::queue<std::wstring> outQueue;
     std::mutex outMutex;
     std::atomic<bool> subscribed{false};
+    // This client's own push rate, and when it is next owed one. See the
+    // AnySubscriberDue / BroadcastDue / MarkPushed trio in the header.
+    //
+    // nextDueMs == 0 means "owed one now", which is what a client that has
+    // just subscribed should get rather than waiting out an interval it was
+    // not present for.
+    std::atomic<unsigned> intervalMs{ (unsigned)kPushIntervalDefaultMs };
+    std::atomic<unsigned> nextDueMs{0};
     PipeServer::Impl* server = nullptr;
     std::atomic<bool> finished{false};
     // Set when Stop() gave up waiting for this thread: the context is
@@ -81,12 +137,16 @@ struct PipeServer::Impl {
     }
 
     void AcceptLoop() {
+        // Built once for the life of the loop: every instance of the pipe gets
+        // the same descriptor, and the SDDL is parsed once rather than per
+        // connection.
+        PipeSecurity security;
         HANDLE hConnectEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         while (WaitForSingleObject(hShutdown, 0) != WAIT_OBJECT_0) {
             HANDLE hPipe = CreateNamedPipeW(pipeName.c_str(),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES, kBufBytes, kBufBytes, 0, nullptr);
+                PIPE_UNLIMITED_INSTANCES, kBufBytes, kBufBytes, 0, security.Get());
             if (hPipe == INVALID_HANDLE_VALUE) break;
             SetEvent(hListening);            // Start() unblocks: a client can connect now
 
@@ -153,9 +213,18 @@ struct PipeServer::Impl {
             std::wstring msg(buf.data(), rd / sizeof(wchar_t));
             while (!msg.empty() && msg.back() == L'\0') msg.pop_back();
             bool wantSub = ctx->subscribed.load();
+            // -1 means "the client did not ask", which leaves the rate it
+            // already had -- a client may subscribe once and never mention a
+            // rate again.
+            int wantInterval = -1;
             std::vector<std::wstring> replies;
-            try { if (handler) replies = handler(msg, &wantSub); } catch (...) {}
-            ctx->subscribed = wantSub;
+            try { if (handler) replies = handler(msg, &wantSub, &wantInterval); } catch (...) {}
+            const bool wasSubscribed = ctx->subscribed.exchange(wantSub);
+            if (wantInterval > 0) ctx->intervalMs = (unsigned)wantInterval;
+            // Subscribing is itself a reason to be owed a push: the first one
+            // carries the whole device list, and waiting out an interval the
+            // client was not present for is just a slower start.
+            if (wantSub && !wasSubscribed) ctx->nextDueMs = 0;
             for (const auto& r : replies) {
                 std::lock_guard<std::mutex> lock(ctx->outMutex);
                 ctx->outQueue.push(r);
@@ -289,6 +358,64 @@ int PipeServer::ClientCount() const {
     for (auto* ctx : m_impl->clients)
         if (!ctx->finished.load()) ++n;
     return n;
+}
+
+// A subscriber is due when it has never been pushed to (nextDue == 0) or its
+// own interval has elapsed. Unsigned subtraction, so the 49-day GetTickCount
+// wrap is handled rather than hoped about.
+static bool DueNow(unsigned nextDueMs, unsigned nowMs) {
+    return nextDueMs == 0 || (int)(nowMs - nextDueMs) >= 0;
+}
+
+bool PipeServer::AnySubscriberDue(unsigned nowMs) const {
+    if (!m_impl) return false;
+    std::lock_guard<std::mutex> lock(m_impl->clientsMutex);
+    for (auto* ctx : m_impl->clients)
+        if (!ctx->finished.load() && ctx->subscribed.load() &&
+            DueNow(ctx->nextDueMs.load(), nowMs))
+            return true;
+    return false;
+}
+
+void PipeServer::BroadcastDue(const std::wstring& msg, unsigned nowMs) {
+    if (!m_impl) return;
+    std::lock_guard<std::mutex> lock(m_impl->clientsMutex);
+    for (auto* ctx : m_impl->clients) {
+        if (ctx->finished.load() || !ctx->subscribed.load()) continue;
+        if (!DueNow(ctx->nextDueMs.load(), nowMs)) continue;
+        {
+            std::lock_guard<std::mutex> qlock(ctx->outMutex);
+            ctx->outQueue.push(msg);
+        }
+        SetEvent(ctx->hOutEvent);
+    }
+}
+
+void PipeServer::MarkPushed(unsigned nowMs) {
+    if (!m_impl) return;
+    std::lock_guard<std::mutex> lock(m_impl->clientsMutex);
+    for (auto* ctx : m_impl->clients) {
+        if (ctx->finished.load() || !ctx->subscribed.load()) continue;
+        if (!DueNow(ctx->nextDueMs.load(), nowMs)) continue;
+        // Advance from the PREVIOUS due time, not from now.
+        //
+        // The tick is 100 ms, so "now + 250" always lands between two ticks
+        // and waits for the later one: measured, a client on the default 250
+        // was pushed to every 332 ms. Carrying the phase forward puts the due
+        // times on 250, 500, 750 and the pushes on 300, 500, 800 -- individual
+        // gaps of 200 and 300, averaging the 250 that was asked for.
+        //
+        // The clamp is what the naive version was protecting against: a client
+        // that was not pushed to for a while -- nothing subscribed, the app in
+        // the tray, the machine asleep -- must not then be owed a burst of
+        // catch-up pushes it has no use for.
+        const unsigned interval = ctx->intervalMs.load();
+        const unsigned prev = ctx->nextDueMs.load();
+        unsigned next = prev ? prev + interval : nowMs + interval;
+        if ((int)(next - nowMs) <= 0) next = nowMs + interval;   // too far behind: resync
+        if (next == 0) next = 1;            // 0 is reserved for "owed now"
+        ctx->nextDueMs = next;
+    }
 }
 
 bool PipeServer::HasSubscribers() const {

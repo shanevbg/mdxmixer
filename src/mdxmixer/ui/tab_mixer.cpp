@@ -17,6 +17,7 @@
 #include "ui/ui_context.h"
 #include "app/channel_setup.h"
 #include "routing/sonar_api.h"
+#include "dsp/meter_ballistics.h"
 #include "ui/controls.h"
 #include "ui/owner_draw.h"
 #include "ui/ui_metrics.h"
@@ -104,12 +105,17 @@ struct Row {
     // stable_partition across the entire fader list, so a failover device
     // outranks every channel too. This is that behaviour on a sectioned layout.
     bool atTop = false;
-    // What is actually flowing, 0..1, or kPeakUnknown (-1) when there is no
+    // What this ROW is passing, 0..1, or kPeakUnknown (-1) when there is no
     // meter to read. The meter below draws only for peak > 0, so an unknown
     // row paints nothing -- which is right, and is also what a zero did, so
     // the -1 costs no extra handling here. It matters on the wire, where a
     // client sorting by what is making sound must not read "cannot know" as
     // "silent" (docs/ipc.md §2.1).
+    //
+    // A device row's is the endpoint's own meter, which is already what is
+    // leaving for that device. A channel row's is the channel source through
+    // THIS side's fader (FaderPeak), because a row is one of the two gains and
+    // the source peak belongs to neither of them.
     float peak = kPeakUnknown;
 };
 
@@ -137,6 +143,14 @@ struct MixerTabState {
     // had nothing row-specific on it. Geometry answers for the whole row,
     // including the gaps between its controls.
     std::vector<int> rowTop;
+    // How long since the last meter update, and when it was.
+    //
+    // MEASURED rather than assumed to be the timer interval: a refresh also
+    // happens on a rebuild, a tab switch and a device change, and a meter that
+    // falls by "one tick" regardless of how long the tick was empties itself
+    // during any burst of them.
+    unsigned meterTickMs = 0;
+    unsigned meterElapsedMs = 0;
     int scrollY = 0;          // the list is longer than any window; see LayoutRows
     int contentH = 0;
     int selected = -1;        // device row whose name the rename box edits
@@ -569,6 +583,30 @@ void Build(HWND hwnd, MixerTabState* st) {
             CreateWindowExW(0, L"STATIC", name.c_str(), WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                             0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)(base + 0), inst, nullptr);
 
+            // A peak meter on the channel rows too (fj#4). The device rows
+            // have had one since the outage where every other indicator read
+            // healthy and nothing could be heard; the channels have carried
+            // the same number over the wire since MDXM_CHAN|peak, and this
+            // window was the one surface not showing it.
+            //
+            // EACH ROW SHOWS WHAT ITS OWN FADER IS PASSING -- not the channel's
+            // source peak, which is what MDXM_CHAN carries and what this first
+            // drew. The source is one number measured before both gains, so on
+            // a fader row it is simply the wrong quantity: sonar:aux with its
+            // Personal fader at zero and its Streaming fader at 100 painted a
+            // full green bar beside a fader passing nothing, and read exactly
+            // as it looked -- "the peak meters you get for the sonar channels
+            // are the streaming channels, not the personal channels".
+            //
+            // So both rows get a meter and each is scaled by its own side. The
+            // pair now says the useful thing at a glance: what is reaching
+            // Shane, and what is reaching the stream, which on this machine are
+            // deliberately one to ten percent apart.
+            CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
+                            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)(base + kFieldMeter),
+                            inst, nullptr);
+            row.peak = FaderPeak(c, row.mix);
+
             // Fader control, as on the device rows below: a slider, or the
             // step buttons from mdx12's option.
             if (!st->spinBoxes) {
@@ -832,12 +870,16 @@ void Rebuild(HWND hwnd, MixerTabState* st) {
 
 // Pin and hide, written through the same anchor the name uses so they survive
 // Windows handing the device a new endpoint id.
+//
+// No Rebuild here: SetDeviceView rebuilds every page, because the same flags
+// can now be set over the pipe (fj#8) and that path has to file the row away
+// in this window too. Rebuilding here as well would do it twice.
 void SetRowView(HWND hwnd, MixerTabState* st, int index, bool hidden, bool pinned) {
+    (void)hwnd;
     if (index < 0 || index >= (int)st->rows.size()) return;
     const Row& row = st->rows[(size_t)index];
     if (row.kind != RowKind::DeviceVolume) return;
     st->ctx->ctl->SetDeviceView(row.channelId, row.containerId, row.windowsName, hidden, pinned);
-    Rebuild(hwnd, st);
 }
 
 void AddChannelFromBuilder(HWND hwnd, MixerTabState* st) {
@@ -970,7 +1012,14 @@ void ShowRowMenu(HWND hwnd, MixerTabState* st, int index, POINT screen) {
     DestroyMenu(menu);
     switch (cmd) {
     case kMenuPin:
-        SetRowView(hwnd, st, index, st->rows[(size_t)index].hidden,
+        // Pinning a hidden device unhides it, the mirror of the rule below:
+        // the two cannot both be true, and a row held at the top of a list it
+        // is absent from is the same contradiction read the other way round.
+        // (A hidden row is only right-clickable at all while Show hidden is
+        // on, so without this the pin would vanish again the moment it was
+        // switched off.) Unpinning says nothing about hiding.
+        SetRowView(hwnd, st, index,
+                   st->rows[(size_t)index].pinned ? st->rows[(size_t)index].hidden : false,
                    !st->rows[(size_t)index].pinned);
         break;
     case kMenuHide:
@@ -1033,10 +1082,12 @@ void ToggleMute(HWND hwnd, MixerTabState* st, int index) {
     InvalidateRect(icon, nullptr, TRUE);
 }
 
-void RefreshDeviceRows(HWND hwnd, MixerTabState* st) {
-    // Device levels are owned by Windows, so they can move underneath us —
-    // the tray slider, a headset's own wheel, another app. Poll them back.
-    auto levels = st->ctx->ctl->GetDeviceLevels();
+// `levels` is the sweep the caller has already run. A parameter rather than
+// another call: the Sonar channel meters are joined off the SAME sweep, so a
+// second one here would cost a sweep AND leave the channel rows reading the
+// older of the two.
+void RefreshDeviceRows(HWND hwnd, MixerTabState* st,
+                       const std::vector<DeviceLevel>& levels) {
     for (size_t i = 0; i < st->rows.size(); ++i) {
         if (st->rows[i].kind != RowKind::DeviceVolume) continue;
         const DeviceLevel* found = nullptr;
@@ -1062,8 +1113,16 @@ void RefreshDeviceRows(HWND hwnd, MixerTabState* st) {
         // Repaint only when the bar would actually move: at 250 ms this runs
         // for every device row, and invalidating all of them unconditionally
         // is a repaint of the whole column four times a second for nothing.
-        if (fabsf(found->peak - st->rows[i].peak) > 0.004f) {
-            st->rows[i].peak = found->peak;
+        //
+        // Drawn from the UNHELD reading through this tab's own fall, not from
+        // the held one the wire carries: a bar that sits still for 1.5 s and
+        // then drops in one step reads as a stuck meter, which is half of
+        // "can we make the system a little more responsive with the sonar
+        // muting and meters" (dsp/meter_ballistics.h).
+        const float shownPeak =
+            MeterFall(st->rows[i].peak, found->peakNow, st->meterElapsedMs);
+        if (fabsf(shownPeak - st->rows[i].peak) > 0.004f) {
+            st->rows[i].peak = shownPeak;
             InvalidateRect(GetDlgItem(hwnd, base + kFieldMeter), nullptr, FALSE);
         }
         if (found->mute != st->rows[i].muted) {
@@ -1124,6 +1183,16 @@ void ApplyRename(HWND hwnd, MixerTabState* st) {
 }
 
 void Refresh(HWND hwnd, MixerTabState* st) {
+    const unsigned now = (unsigned)GetTickCount();
+    st->meterElapsedMs = st->meterTickMs ? (now - st->meterTickMs) : 0;
+    st->meterTickMs = now;
+    // THE SWEEP FIRST, then the channels.
+    //
+    // The Sonar channel peaks are joined off the sweep's results, so asking
+    // for channels before running it drew every Sonar meter from the PREVIOUS
+    // tick -- a whole frame of lag on the rows most worth watching, for the
+    // sake of the order two lines happened to be written in.
+    const auto levels = st->ctx->ctl->GetDeviceLevels();
     auto chans = st->ctx->ctl->GetChannels();
     size_t r = 0;
     for (const auto& c : chans) {
@@ -1152,9 +1221,26 @@ void Refresh(HWND hwnd, MixerTabState* st) {
                 SetWindowTextW(icon, muted ? kGlyphMuted : kGlyphLive);
                 InvalidateRect(icon, nullptr, TRUE);
             }
+            // The channel meter, scaled by THIS row's fader (fj#4). Repainted
+            // only when the bar would actually move, for the reason
+            // RefreshDeviceRows gives: at 250 ms, invalidating every row
+            // unconditionally is a repaint of the whole column four times a
+            // second for nothing.
+            //
+            // It follows the fader as it is dragged, which is the point: the
+            // bar is what this side is passing, so moving the Personal fader
+            // moves the Personal meter and leaves the Streaming one alone.
+            const float rowPeak = MeterFall(
+                st->rows[r].peak,
+                FaderPeakNow(c, personal ? Mix::Personal : Mix::Streaming),
+                st->meterElapsedMs);
+            if (fabsf(rowPeak - st->rows[r].peak) > 0.004f) {
+                st->rows[r].peak = rowPeak;
+                InvalidateRect(GetDlgItem(hwnd, base + kFieldMeter), nullptr, FALSE);
+            }
         }
     }
-    RefreshDeviceRows(hwnd, st);
+    RefreshDeviceRows(hwnd, st, levels);
 }
 
 LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {

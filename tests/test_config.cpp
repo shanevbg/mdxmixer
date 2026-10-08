@@ -95,6 +95,89 @@ MDXM_TEST_CASE(Config_AtomicSaveRoundTrips) {
     DeleteFileW(file.c_str());
 }
 
+// THE ANCHOR THAT SURVIVES A NEW ADAPTER HAS TO SURVIVE A SAVE FIRST.
+//
+// It did not. DeviceRef gained a btAddress and the allowlist was written by its
+// own hand-rolled loop a hundred lines from WriteDeviceRef, so personalOutput
+// kept the address and every failover entry quietly lost it. The symptom was
+// perfect and useless: the log said entries had been healed on every startup,
+// and the file came back without a single address in it.
+//
+// Both halves are checked here because the bug lived in the gap between them.
+MDXM_TEST_CASE(Config_BluetoothAddressesRoundTripOnEveryDeviceRef) {
+    MixerConfig c;
+    c.personalOutput = { L"{hp}", L"Headphones (12- WF-1000XM5)", L"ac800a294655" };
+    c.personalFailover.allow.push_back({ L"{a}", L"Headphones (11- WF-1000XM5)", L"ac800aaade78" });
+    c.personalFailover.allow.push_back({ L"{b}", L"Headphones (10- WF-1000XM5)", L"8099e7813463" });
+    // One with none, because most endpoints are not on Bluetooth at all and an
+    // empty field must not come back as something else.
+    c.personalFailover.allow.push_back({ L"{c}", L"CABLE Input (VB-Audio Virtual Cable)", L"" });
+
+    const MixerConfig back = ConfigFromJson(JsonParse(ConfigToJson(c)));
+    CHECK(back.personalOutput.btAddress == L"ac800a294655");
+    CHECK(back.personalFailover.allow.size() == 3);
+    CHECK(back.personalFailover.allow[0].btAddress == L"ac800aaade78");
+    CHECK(back.personalFailover.allow[1].btAddress == L"8099e7813463");
+    CHECK(back.personalFailover.allow[2].btAddress.empty());
+    // And the fields it used to carry are still there.
+    CHECK(back.personalFailover.allow[0].id == L"{a}");
+    CHECK(back.personalFailover.allow[1].name == L"Headphones (10- WF-1000XM5)");
+}
+
+// A file written before the field existed -- which is every config on the
+// machine today. It must load, not take defaults, and simply have no address
+// yet; HealDeviceRef fills it the first time the entry meets its device.
+MDXM_TEST_CASE(Config_AnOlderFileWithNoAddressStillLoads) {
+    // A custom delimiter: the device names contain ")" and the default raw
+    // string would end at the first one.
+    const JsonValue root = JsonParse(
+        LR"json({"personalFailover":{"armed":true,"allow":[{"id":"{a}","name":"Headphones (11- WF-1000XM5)"}]}})json");
+    const MixerConfig c = ConfigFromJson(root);
+    CHECK(c.personalFailover.armed);
+    CHECK(c.personalFailover.allow.size() == 1);
+    CHECK(c.personalFailover.allow[0].name == L"Headphones (11- WF-1000XM5)");
+    CHECK(c.personalFailover.allow[0].btAddress.empty());
+}
+
+// The sticky tack has to survive a restart, or it is not sticky -- which is
+// the whole reason MDropDX12 persists OnTop per tool window.
+MDXM_TEST_CASE(Config_AlwaysOnTopRoundTripsAndDefaultsOff) {
+    MixerConfig c;
+    CHECK(!c.ui.alwaysOnTop);     // the whole mixer, not a tool window: off until asked
+    c.ui.alwaysOnTop = true;
+    CHECK(ConfigFromJson(JsonParse(ConfigToJson(c))).ui.alwaysOnTop);
+    c.ui.alwaysOnTop = false;
+    CHECK(!ConfigFromJson(JsonParse(ConfigToJson(c))).ui.alwaysOnTop);
+    // A file written before the setting existed must not come back pinned.
+    CHECK(!ConfigFromJson(JsonParse(LR"({"ui":{"theme":"system"}})")).ui.alwaysOnTop);
+}
+
+// The switch behind "MDx12 adaptive overlay" in Options. Default ON, because
+// it is what makes the two programs behave when they run together -- which on
+// this machine is most of the time.
+MDXM_TEST_CASE(Config_Mdx12AdaptiveOverlayDefaultsOnAndRoundTrips) {
+    MixerConfig c;
+    CHECK(c.batteryOverlay.mdx12Adaptive);
+    c.batteryOverlay.mdx12Adaptive = false;
+    CHECK(!ConfigFromJson(JsonParse(ConfigToJson(c))).batteryOverlay.mdx12Adaptive);
+    c.batteryOverlay.mdx12Adaptive = true;
+    CHECK(ConfigFromJson(JsonParse(ConfigToJson(c))).batteryOverlay.mdx12Adaptive);
+    // A file written before the switch existed gets the default, not false --
+    // every config on this machine is such a file.
+    CHECK(ConfigFromJson(JsonParse(LR"({"batteryOverlay":{"opacity":85}})"))
+              .batteryOverlay.mdx12Adaptive);
+}
+
+// "I don't think mdxmixer remembers my active tab" -- it did not, because
+// startup called SwitchTab(0) and nothing ever wrote the choice down.
+MDXM_TEST_CASE(Config_ActiveTabRoundTrips) {
+    MixerConfig c;
+    CHECK(c.ui.activeTab == 0);          // Mixer, for a config that has never said
+    c.ui.activeTab = 3;                  // Devices
+    CHECK(ConfigFromJson(JsonParse(ConfigToJson(c))).ui.activeTab == 3);
+    CHECK(ConfigFromJson(JsonParse(LR"({"ui":{"theme":"system"}})")).ui.activeTab == 0);
+}
+
 MDXM_TEST_CASE(Config_DeviceFilingRoundTrips) {
     // A pin or a hide is worth as much as a name: the list has to come back the
     // way it was left, including for a device whose only entry is a hide.

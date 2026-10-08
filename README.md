@@ -81,6 +81,7 @@ answer — pick one row from each group, not all of them:
 | | **or** loopback of a render endpoint you already have | free, no cable |
 | **destination** | the **shared-memory ring**, read by [MDropDX12](https://github.com/shanevbg/MDropDX12) | free, no cable |
 | | **or** a second cable, if a recorder needs to see a device | the A+B pack |
+| | **or** the **network**, as a VBAN stream — see below | free, no cable |
 
 So the free configuration is real: one cable, one app on its own channel with
 an independent level for your ears and for everything downstream, and the
@@ -95,6 +96,56 @@ and it needs nothing at all.
 > computed and thrown away, so an `[S]` fader will move and change nothing
 > anybody can hear. It is not broken and it is not a limitation; it is a
 > setting nobody has filled in, and it is the step people miss.
+
+### Listening on a phone — the network stream (VBAN)
+
+mdxmixer can put the mix on the network as a standards-compliant
+[VBAN](https://vb-audio.com/Voicemeeter/vban.htm) stream, so you can walk away
+from the desk and keep listening on a phone — and, because it is the real
+protocol rather than something of our own, **VB-Audio's own free VBAN Receptor
+Lite plays it with nothing else installed**. There is no app to write before you
+can hear it.
+
+By default it sends the **personal** mix: what the headphones are hearing, with
+your per-channel balance and personal mutes, rather than the programme mix. The
+one setting that matters is the gain — the personal sum on a machine like this
+runs at a few percent of full scale, because the faders *are* the listening
+level, so it is amplified PC-side before it leaves. Turn it on with
+
+```text
+MDXM_VBAN|on=1|open=1       (over the pipe, or the vban section of mdxmixer.json)
+```
+
+and point a receiver at this machine on UDP **6980**. `open=1` is what lets a
+plain VBAN tool listen at all: the protocol has no notion of authentication, so
+subscription-without-a-PIN is an explicit opt-in. `mdxmixer --vbanrx <ip>` is the
+quickest way to prove the sending end from this machine, phone or no phone.
+
+Nothing is sent until something asks for it, and the stream stops when the last
+listener stops asking. Expect roughly 200 ms end to end on ordinary Wi-Fi, so
+this is for listening rather than for anything that has to line up with a
+picture — `srclatencyms` in `MDXM_VBANSTATE` is this machine's share of it, for
+a receiver that wants to show the total.
+
+It can send **pictures of the displays** too, on the same socket: one JPEG per
+screen a couple of times a second, as VBAN's own `FRAME` sub-protocol, which is
+what VB-Audio's VBAN-Screen reads. Each screen goes out as `VIDEO<n>`, where *n*
+is its Windows display number. The capture is GPU-downscaled before it is read
+back, so a 4K screen costs a dozen kilobytes rather than thirty megabytes, and
+nothing is captured at all while nobody is watching.
+
+> **The installer adds the firewall rule; a portable copy needs one.** The MSI
+> authorises `mdxmixer.exe` for inbound UDP — program-scoped, not port-scoped, so
+> changing the port later cannot strand it. Running from the zip, do it once by
+> hand:
+>
+> ```text
+> netsh advfirewall firewall add rule name="mdxmixer VBAN" dir=in action=allow ^
+>   program="C:\path\to\mdxmixer.exe" protocol=udp
+> ```
+>
+> Without it the symptom is simply a phone that never connects, with nothing
+> anywhere to explain why.
 
 ### Where Sonar or Voicemeeter fit in — optional, either, neither
 
@@ -372,6 +423,8 @@ mdxmixer --sessions           what is playing, and whether per-app routing works
 mdxmixer --sonarch            Sonar's channels and their two levels
 mdxmixer --meter <id> 5       is Windows actually putting audio on this device?
 mdxmixer --monitor <in> <out> passthrough: capture, cushion, render at unity
+mdxmixer --vban               what the network stream is doing, once a second
+mdxmixer --vbanrx <ip> [port] subscribe to a VBAN stream and report what arrives
 ```
 
 `--levels` and `--btinfo` are the two worth pasting into a bug report.

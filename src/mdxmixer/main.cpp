@@ -23,6 +23,11 @@
 #include "routing/sonar_control.h"
 #include "engine/capture_stream.h"
 #include "engine/render_stream.h"
+#include "ipc/pipe_server.h"
+#include "net/vban_protocol.h"
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
 #include "routing/audio_policy_config.h"
 #include "routing/sessions.h"
 #include "app/app_controller.h"
@@ -207,6 +212,169 @@ static int RunFeed(int seconds) {
     return 0;
 }
 
+// mdxmixer.exe --vban [seconds]
+//
+// Asks the RUNNING instance what its network stream is doing, once a second,
+// over the pipe. The counterpart of --feed for the other audio sink: the
+// question it answers is "is anything going out, and to whom".
+static int RunVbanStatus(int seconds) {
+    HANDLE pipe = CreateFileW(mdxm::PipeServer::kPipeName, GENERIC_READ | GENERIC_WRITE,
+                              0, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE) {
+        wprintf(L"mdxmixer is not running (no pipe)\n");
+        return 1;
+    }
+    DWORD mode = PIPE_READMODE_MESSAGE;
+    SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr);
+    for (int i = 0; i < seconds; ++i) {
+        const std::wstring msg = L"MDXM_VBAN";
+        DWORD wrote = 0;
+        if (!WriteFile(pipe, msg.c_str(), (DWORD)((msg.size() + 1) * sizeof(wchar_t)),
+                       &wrote, nullptr))
+            break;
+        wchar_t buf[4096] = {};
+        DWORD got = 0;
+        if (!ReadFile(pipe, buf, (DWORD)sizeof buf - sizeof(wchar_t), &got, nullptr)) break;
+        wprintf(L"%s\n", buf);
+        if (i + 1 < seconds) Sleep(1000);
+    }
+    CloseHandle(pipe);
+    return 0;
+}
+
+// mdxmixer.exe --vbanrx <host> [port] [seconds]
+//
+// A VBAN receiver with no audio output: it subscribes the way the phone does
+// (a PING0 every two seconds) and reports what arrives. It exists so the sending
+// end can be proved from this machine, without a phone and without an audio
+// device -- and so that "the phone hears nothing" can be split into "nothing is
+// being sent" and "something is wrong at the phone".
+static int RunVbanReceive(const std::wstring& host, int port, int seconds,
+                          const std::wstring& pin) {
+    WSADATA w;
+    if (WSAStartup(MAKEWORD(2, 2), &w) != 0) { wprintf(L"winsock failed\n"); return 1; }
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) { wprintf(L"no socket\n"); return 1; }
+    DWORD tmo = 500;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char*)&tmo, (int)sizeof tmo);
+
+    std::string narrow;
+    for (wchar_t c : host) narrow.push_back(c < 128 ? (char)c : '?');
+    sockaddr_in to = {};
+    to.sin_family = AF_INET;
+    to.sin_port = htons((unsigned short)port);
+    if (inet_pton(AF_INET, narrow.c_str(), &to.sin_addr) != 1) {
+        wprintf(L"'%s' is not an IPv4 address\n", host.c_str());
+        closesocket(s);
+        return 1;
+    }
+    wprintf(L"listening to %s:%d (ping every 2 s)\n", host.c_str(), port);
+
+    const auto ping = [&](uint32_t txn) {
+        mdxm::vban::Header h = {};
+        h.vban = mdxm::vban::kMagic;
+        h.format_SR = mdxm::vban::kProtoService;
+        h.format_nbs = mdxm::vban::kServiceFnPing0;
+        h.format_nbc = mdxm::vban::kServiceIdentification;
+        mdxm::vban::FillStreamName(h.streamname, "VBAN Service");
+        h.nuFrame = txn;
+        sendto(s, (const char*)&h, (int)sizeof h, 0, (sockaddr*)&to, (int)sizeof to);
+    };
+
+    // With a PIN, authenticate the way the phone does -- enough to raise the
+    // approval prompt on the PC and then exercise the control channel. A
+    // development aid: there is no phone in the room while this is being built.
+    const auto sendAuth = [&] {
+        if (pin.empty()) return;
+        char sname[mdxm::vban::kStreamNameSize];
+        mdxm::vban::FillStreamName(sname, "mdxmixer");
+        wchar_t host16[64] = {};
+        DWORD hlen = 63;
+        GetComputerNameW(host16, &hlen);
+        const std::wstring rec = L"MDXM_AUTH|pin=" + pin + L"|device=vbanrx-cli|name=" +
+                                 std::wstring(host16) + L" (--vbanrx)";
+        uint8_t out[mdxm::vban::kMaxPacket];
+        const size_t n = mdxm::vban::BuildTxtPacket(out, sname, 0,
+                                                    mdxm::vban::WideToUtf8(rec));
+        if (n) sendto(s, (const char*)out, (int)n, 0, (sockaddr*)&to, (int)sizeof to);
+    };
+
+    uint8_t buf[2048];
+    uint32_t txn = 1;
+    bool haveSeq = false;
+    uint32_t lastSeq = 0;
+    uint64_t packets = 0, gaps = 0, lostPackets = 0, replies = 0;
+    float peak = 0.0f;
+    ULONGLONG nextPing = 0, nextReport = GetTickCount64() + 1000;
+    const ULONGLONG until = GetTickCount64() + (ULONGLONG)seconds * 1000;
+    while (GetTickCount64() < until) {
+        if (GetTickCount64() >= nextPing) {
+            ping(txn++);
+            // Re-sent with every ping: a device waiting for approval keeps asking,
+            // and the PC is only prompted once, so this costs nothing.
+            sendAuth();
+            nextPing = GetTickCount64() + 2000;
+        }
+        const int n = recvfrom(s, (char*)buf, (int)sizeof buf, 0, nullptr, nullptr);
+        if (n > 0) {
+            const mdxm::vban::Parsed p = mdxm::vban::ParsePacket(buf, (size_t)n);
+            if (p.valid && p.proto == mdxm::vban::kProtoService) {
+                ++replies;
+                if (replies == 1 && p.dataLen >= sizeof(mdxm::vban::Ping0)) {
+                    mdxm::vban::Ping0 id;
+                    memcpy(&id, p.data, sizeof id);
+                    wprintf(L"server: %hs / %hs, %u Hz preferred, features 0x%X\n",
+                            id.deviceName, id.hostName, id.preferredRate, id.bitFeature);
+                }
+            } else if (p.valid && p.proto == mdxm::vban::kProtoTxt) {
+                std::string text;
+                if (mdxm::vban::ParseTxt(p, &text)) {
+                    bool okText = false;
+                    wprintf(L"  <- %s\n",
+                            mdxm::vban::Utf8ToWide(text, &okText).c_str());
+                }
+            } else if (p.valid && p.proto == mdxm::vban::kProtoAudio) {
+                ++packets;
+                if (haveSeq && p.hdr.nuFrame != lastSeq + 1) {
+                    ++gaps;
+                    // Serial-number arithmetic, so a wrap is not a gap of 4
+                    // billion.
+                    lostPackets += (uint64_t)(uint32_t)(p.hdr.nuFrame - lastSeq - 1);
+                }
+                lastSeq = p.hdr.nuFrame;
+                haveSeq = true;
+                const size_t samples = p.dataLen / 2;      // int16 assumed
+                for (size_t i = 0; i < samples; ++i) {
+                    int16_t v = 0;
+                    memcpy(&v, p.data + i * 2, 2);
+                    const float a = (v < 0 ? -(float)v : (float)v) / 32767.0f;
+                    if (a > peak) peak = a;
+                }
+            }
+        }
+        if (GetTickCount64() >= nextReport) {
+            wprintf(L"  %llu packets, %llu gaps (%llu lost), peak %.4f\n",
+                    (unsigned long long)packets, (unsigned long long)gaps,
+                    (unsigned long long)lostPackets, peak);
+            packets = gaps = lostPackets = 0;
+            peak = 0.0f;
+            nextReport = GetTickCount64() + 1000;
+        }
+    }
+    closesocket(s);
+    if (!replies) {
+        wprintf(L"no reply to any ping: nothing is listening on %s:%d\n",
+                host.c_str(), port);
+        return 1;
+    }
+    if (!haveSeq) {
+        wprintf(L"answered pings but sent no audio: the stream is not emitting "
+                L"(check that this address is entitled -- open=1, or authorised)\n");
+        return 1;
+    }
+    return 0;
+}
+
 // mdxmixer.exe --meter <endpointSubstring> [seconds]
 //
 // The peak level Windows is actually putting ON an endpoint, sampled ten times
@@ -327,6 +495,39 @@ static int RunAppRoute(const wchar_t* exeNeedle, const wchar_t* epNeedle) {
     }
     if (!moved) { wprintf(L"nothing matching '%s' has an audio session\n", exeNeedle); return 1; }
     wprintf(L"%d process(es) moved\n", moved);
+    return 0;
+}
+
+// mdxmixer.exe --sweepprof [n]
+// Where the endpoint sweep spends its time, n sweeps in a row (default 5).
+//
+// The FIRST sweep of a process is the honest "before" number: nothing is
+// cached yet, so it does exactly what this code did before the cache existed
+// -- a property store and two COM activations per endpoint, every time. Every
+// sweep after it is the "after". One build, both measurements, and no claim
+// that cannot be checked on the machine it was made on.
+//
+// It exists because the cost of this sweep went unnoticed for a month while it
+// blocked the UI thread for 98-161 ms out of every 250 ms tick, and the only
+// reason it was ever found was measuring it from outside over the pipe.
+static int RunSweepProfile(int sweeps) {
+    if (sweeps < 1) sweeps = 1;
+    if (sweeps > 50) sweeps = 50;
+    wprintf(L"%-4s %8s %8s %8s %8s %8s %8s %8s   %s\n",
+            L"#", L"total", L"bt", L"enum", L"names", L"activate", L"read", L"registry",
+            L"endpoints");
+    for (int i = 0; i < sweeps; ++i) {
+        mdxm::ListEndpointVolumes();
+        const mdxm::SweepProfile p = mdxm::LastSweepProfile();
+        wprintf(L"%-4d %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f   %d (%d active, "
+                L"%d identity-only, cache %d hit / %d miss / %d dropped)\n",
+                i + 1, p.totalMs, p.btInfoMs, p.enumMs, p.nameMs, p.activateMs,
+                p.readMs, p.containerMs + p.lastSeenMs,
+                p.endpoints, p.active, p.identityOnly,
+                p.cacheHits, p.cacheMisses, p.cacheDropped);
+        Sleep(250);   // the tick this runs on in the program
+    }
+    mdxm::ReleaseEndpointCache();
     return 0;
 }
 
@@ -547,6 +748,35 @@ static int AppMain(HINSTANCE hInstance) {
                 LocalFree(argv);
                 return rc;
             }
+            if (wcscmp(argv[i], L"--vban") == 0) {
+                AttachOrAllocConsole();
+                int secs = (i + 1 < argc) ? _wtoi(argv[i + 1]) : 3;
+                if (secs < 1 || secs > 60) secs = 3;
+                int rc = RunVbanStatus(secs);
+                LocalFree(argv);
+                return rc;
+            }
+            if (wcscmp(argv[i], L"--vbanrx") == 0 && i + 1 < argc) {
+                AttachOrAllocConsole();
+                // --vbanrx <host> [port] [seconds] [--auth <pin>]
+                int port = mdxm::vban::kDefaultPort, secs = 5;
+                std::wstring pin;
+                int positional = 0;
+                for (int a = i + 1 + 1; a < argc; ++a) {
+                    if (wcscmp(argv[a], L"--auth") == 0 && a + 1 < argc) {
+                        pin = argv[++a];
+                        continue;
+                    }
+                    if (positional == 0) port = _wtoi(argv[a]);
+                    else if (positional == 1) secs = _wtoi(argv[a]);
+                    ++positional;
+                }
+                if (port < 1 || port > 65535) port = mdxm::vban::kDefaultPort;
+                if (secs < 1 || secs > 300) secs = 5;
+                int rc = RunVbanReceive(argv[i + 1], port, secs, pin);
+                LocalFree(argv);
+                return rc;
+            }
             if (wcscmp(argv[i], L"--meter") == 0 && i + 1 < argc) {
                 AttachOrAllocConsole();
                 CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -569,6 +799,15 @@ static int AppMain(HINSTANCE hInstance) {
                 AttachOrAllocConsole();
                 CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
                 int rc = RunAppRoute(argv[i + 1], argv[i + 2]);
+                CoUninitialize();
+                LocalFree(argv);
+                return rc;
+            }
+            if (wcscmp(argv[i], L"--sweepprof") == 0) {
+                AttachOrAllocConsole();
+                CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                const int n = (i + 1 < argc && argv[i + 1][0] != L'-') ? _wtoi(argv[i + 1]) : 5;
+                int rc = RunSweepProfile(n);
                 CoUninitialize();
                 LocalFree(argv);
                 return rc;
@@ -633,6 +872,12 @@ static int AppMain(HINSTANCE hInstance) {
         rc = 2;
     }
     app.Stop();
+    // The cached endpoint interfaces were activated on THIS thread, in the
+    // apartment the next line tears down. Released here, while that apartment
+    // still exists; a static destructor would run after it and release into
+    // nothing (endpoint_volume.h).
+    mdxm::ReleaseEndpointCache();
+    mdxm::SonarHttpCloseConnection();
     CoUninitialize();
     if (mutex) CloseHandle(mutex);
     return rc;

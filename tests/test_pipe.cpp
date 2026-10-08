@@ -1,5 +1,6 @@
 #include "test_framework.h"
 #include "ipc/pipe_server.h"
+#include "ui/main_window.h"   // IpcRequest — the marshalled request's lifetime
 #include <windows.h>
 #include <thread>
 
@@ -24,7 +25,7 @@ std::wstring PipeRequest(HANDLE h, const std::wstring& msg) {
 MDXM_TEST_CASE(Pipe_EchoAndBroadcastRoundTrip) {
     PipeServer srv;
     std::wstring err;
-    bool started = srv.Start([](const std::wstring& msg, bool* wantSub) {
+    bool started = srv.Start([](const std::wstring& msg, bool* wantSub, int*) {
         if (msg == L"MDXM_SUBSCRIBE=1") { *wantSub = true; return std::vector<std::wstring>{L"MDXM_OK"}; }
         return std::vector<std::wstring>{L"ECHO|" + msg};
     }, &err, kTestPipe);
@@ -59,7 +60,7 @@ MDXM_TEST_CASE(Pipe_EchoAndBroadcastRoundTrip) {
 MDXM_TEST_CASE(Pipe_HasSubscribersIsNotJustConnected) {
     PipeServer srv;
     std::wstring err;
-    bool started = srv.Start([](const std::wstring& msg, bool* wantSub) {
+    bool started = srv.Start([](const std::wstring& msg, bool* wantSub, int*) {
         if (msg == L"MDXM_SUBSCRIBE=1") { *wantSub = true; return std::vector<std::wstring>{L"MDXM_OK"}; }
         if (msg == L"MDXM_SUBSCRIBE=0") { *wantSub = false; return std::vector<std::wstring>{L"MDXM_OK"}; }
         return std::vector<std::wstring>{L"ECHO|" + msg};
@@ -113,7 +114,7 @@ MDXM_TEST_CASE(Pipe_StopDoesNotDeadlockOnUiMarshal) {
 
     PipeServer srv;
     std::wstring err;
-    CHECK(srv.Start([hwnd](const std::wstring&, bool*) {
+    CHECK(srv.Start([hwnd](const std::wstring&, bool*, int*) {
         SendMessageW(hwnd, WM_APP + 77, 0, 0);          // blocks until this thread pumps
         return std::vector<std::wstring>{L"MDXM_OK"};
     }, &err, kTestPipe2));
@@ -151,4 +152,52 @@ MDXM_TEST_CASE(Pipe_StopDoesNotDeadlockOnUiMarshal) {
     CloseHandle(ready);
     DestroyWindow(hwnd);
     UnregisterClassW(kCls, GetModuleHandleW(nullptr));
+}
+
+// ── the marshalled request outlives the thread that sent it ──────────────
+//
+// THE CRASH THIS PREVENTS, twice on 2026-10-07. The request used to live on
+// the sending pipe thread's stack. SendMessageTimeout gives up after five
+// seconds and that thread returns "busy" -- but the message is still in the
+// UI thread's queue, and returning does not take it back out. When the UI
+// thread got to it, `req->replies = ...` assigned a std::vector into a frame
+// that no longer existed; assigning a vector first destroys what it believes
+// is already there, so it freed garbage pointers. The dump showed exactly
+// that: vector<wstring>::operator= in the handler, _Destroy_range,
+// _Tidy_deallocate, _free_base, __fastfail(FAST_FAIL_INVALID_ARG).
+
+MDXM_TEST_CASE(IpcRequest_StartsHeldByBothSides) {
+    auto* req = new MainWindow::IpcRequest(L"MDXM_PING", false);
+    CHECK(req->refs.load() == 2);     // the sender, and the queued message
+    CHECK(req->msg == L"MDXM_PING");  // COPIED: a pointer to the sender's string
+                                      // is the same bug in a different hat
+    req->Release();
+    req->Release();
+}
+
+MDXM_TEST_CASE(IpcRequest_SurvivesTheSenderGivingUpFirst) {
+    // The timeout order: the sender walks away, and the handler runs later.
+    auto* req = new MainWindow::IpcRequest(L"MDXM_STATE", true);
+    req->Release();                   // SendMessageTimeout expired; sender gone
+    CHECK(req->refs.load() == 1);     // still alive, because the message is not
+
+    // What the handler does next must be safe on an abandoned request.
+    req->replies.push_back(L"MDXM_OK");
+    req->wantSubscribe = false;
+    req->wantIntervalMs = 100;
+    CHECK(req->replies.size() == 1);
+
+    req->Release();                   // and the last one out frees it
+}
+
+MDXM_TEST_CASE(IpcRequest_CarriesTheSubscriptionStateBothWays) {
+    // The flag and the rate used to be pointers into the sender's stack too,
+    // so they had exactly the same hazard and the same fix.
+    auto* req = new MainWindow::IpcRequest(L"MDXM_SUBSCRIBE|1|100", true);
+    CHECK(req->wantSubscribe);        // in: what the client already was
+    CHECK(req->wantIntervalMs == -1); // "did not ask", so the rate is untouched
+    req->wantIntervalMs = 100;        // out: what the handler decided
+    CHECK(req->wantIntervalMs == 100);
+    req->Release();
+    req->Release();
 }

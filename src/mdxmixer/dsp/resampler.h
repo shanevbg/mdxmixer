@@ -22,11 +22,40 @@ namespace mdxm {
 class LinearResampler {
 public:
     void SetRates(double inRate, double outRate) {
+        m_inRate = inRate;
+        m_outRate = outRate;
+        m_speed = 1.0;
         m_ratio = inRate / outRate;      // input frames per output frame
         m_passthrough = (inRate == outRate);
         m_pos = 0.0;
         m_havePrev = false;
     }
+
+    // Consume input faster than real time, to drain a backlogged ring (fj#13).
+    //
+    // A speed of 1.05 takes five percent more input per output frame, so the
+    // producer puts five percent fewer frames into the ring per second than the
+    // consumer takes out, and the depth falls at five percent of real time. The
+    // audio plays correspondingly faster and higher; see dsp/ring_speed.h for
+    // why the rate is proportional to the backlog rather than fixed, and why a
+    // speed BELOW 1.0 -- refilling a ring that has run short -- matters just as
+    // much as draining one that has filled.
+    //
+    // DOES NOT RESET THE POSITION, unlike SetRates: this is adjusted while
+    // audio is flowing, and resetting m_pos mid-stream would put a
+    // discontinuity into the very signal the mechanism exists to keep smooth.
+    //
+    // It also has to switch passthrough OFF. At 48 kHz into a 48 kHz mix the
+    // rates are equal and the resampler is skipped entirely, so without this a
+    // speed trim would silently do nothing -- which is exactly the case on this
+    // machine.
+    void SetSpeed(double speed) {
+        if (speed <= 0.0) speed = 1.0;
+        m_speed = speed;
+        m_ratio = (m_inRate / m_outRate) * speed;
+        m_passthrough = (m_inRate == m_outRate) && (speed == 1.0);
+    }
+    double Speed() const { return m_speed; }
     bool IsPassthrough() const { return m_passthrough; }
 
     size_t EstimateOut(size_t inFrames) const {
@@ -88,6 +117,9 @@ private:
     }
 
     double m_ratio = 1.0;
+    // The rates as given, kept so a speed trim can recompute the ratio without
+    // the caller having to repeat them.
+    double m_inRate = 1.0, m_outRate = 1.0, m_speed = 1.0;
     double m_pos = 0.0;
     bool m_passthrough = true;
     bool m_havePrev = false;

@@ -20,6 +20,19 @@ bool TrayIcon::Add(HWND owner, HICON icon, const wchar_t* tip) {
     return true;
 }
 
+void TrayIcon::Balloon(const wchar_t* title, const wchar_t* text) {
+    if (!m_added) return;
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = m_owner;
+    nid.uID = 1;
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    wcsncpy_s(nid.szInfoTitle, title, _TRUNCATE);
+    wcsncpy_s(nid.szInfo, text, _TRUNCATE);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
 void TrayIcon::Remove() {
     if (!m_added) return;
     NOTIFYICONDATAW nid = {};

@@ -7,6 +7,7 @@
 #include "device/endpoint_volume.h"
 #include "device/device_identity.h"
 #include "device/device_order.h"
+#include "device/sweep_selection.h"
 #include "ipc/protocol.h"
 #include "routing/sessions.h"
 #include "routing/reconcile.h"
@@ -15,6 +16,42 @@
 #include <algorithm>
 
 namespace mdxm {
+
+// THE one marshalling discipline, shared by every transport that carries MDXM
+// records: the pipe, and now the network. Extracted from the pipe handler so the
+// two crashes it encodes stay fixed in exactly one place -- see
+// MainWindow::IpcRequest for what they were.
+//
+// Called from a pipe client thread or from the VBAN receive thread. Marshals onto
+// the UI thread so control stays single-threaded. SendMessageTimeout, not
+// SendMessage: a UI thread that is busy, modal, or shutting down must never park
+// the caller indefinitely (ABORTIFHUNG returns rather than waiting on a hung
+// queue).
+//
+// HEAP OWNED AND REFERENCE COUNTED, never a pointer to this stack.
+// SendMessageTimeout returning does not take the message back out of the UI
+// thread's queue, so a request that times out here is still dispatched
+// afterwards -- into whatever has replaced this frame by then.
+std::vector<std::wstring> DispatchToUi(HWND hwnd, const std::wstring& msg,
+                                       bool* wantSubscribe, int* wantIntervalMs) {
+    auto* req = new MainWindow::IpcRequest(msg, wantSubscribe && *wantSubscribe);
+    DWORD_PTR unused = 0;
+    const bool handled = SendMessageTimeoutW(hwnd, MainWindow::kIpcMsg, (WPARAM)req, 0,
+                                             SMTO_ABORTIFHUNG | SMTO_NORMAL, 5000,
+                                             &unused) != 0;
+    std::vector<std::wstring> replies;
+    if (handled) {
+        // Only now is the handler known to have finished, so only now are these
+        // worth reading.
+        replies = std::move(req->replies);
+        if (wantSubscribe) *wantSubscribe = req->wantSubscribe;
+        if (wantIntervalMs) *wantIntervalMs = req->wantIntervalMs;
+    } else {
+        replies.push_back(L"MDXM_ERR|msg=busy");
+    }
+    req->Release();
+    return replies;
+}
 
 std::wstring AppController::ExeDir() {
     wchar_t exe[MAX_PATH];
@@ -84,10 +121,15 @@ bool AppController::Start(HINSTANCE hInstance) {
             m_window.RebuildPages();
         }
     };
-    m_uiCtx.onTick250ms = [this] { PushPeaks(); };
+    m_uiCtx.onTick250ms = [this] { PushToSubscribers(); TickVban(); };
     m_uiCtx.onSuspend = [this] { m_engine.OnSuspend(); };
     m_uiCtx.onResume = [this] {
         m_engine.OnResume();
+        // A socket does not necessarily survive a Modern Standby resume, and
+        // nothing reports that it did not -- the same shape as the render stream
+        // that came back listed, active and silent. Re-arm it the way
+        // RenderRetry re-arms a render rather than waiting to be told.
+        ApplyVbanConfig();
         // Sonar comes back from a resume in its own time, and sometimes not at
         // all -- the same bug on their side, as Shane put it. Forcing the
         // refresh rather than waiting for the 1 Hz poll means its rows and
@@ -106,8 +148,35 @@ bool AppController::Start(HINSTANCE hInstance) {
         ReconcileRouting(L"resumed from suspend");
         BroadcastState();
     };
+    // An app started playing somewhere. The only thing to do is make the
+    // stored assignments true, which is cheap when they already are:
+    // PlanRouteFixes writes nothing for a session that is already on the right
+    // endpoint, and nothing at all for an app no channel claims.
+    m_uiCtx.onSessionsChangedDebounced = [this] {
+        ReconcileRouting(L"an app started playing");
+    };
+    // Give every stored device reference the anchors it is missing, now, with
+    // whatever is connected. See HealStoredDeviceRefs.
+    HealStoredDeviceRefs(L"startup");
     m_uiCtx.onDeviceChangeDebounced = [this] {
+        // The cached per-endpoint COM interfaces belong to the device set that
+        // just changed: an endpoint that has gone takes its volume and meter
+        // objects with it. Dropped FIRST, so everything below re-reads.
+        //
+        // Here and not in the notification itself, which may only signal
+        // (fj#401) -- this runs on the UI thread, which is the thread that
+        // owns the cache.
+        InvalidateEndpointCache();
+        // A device arriving is the moment its stored entries can learn what
+        // they are missing -- and a change of ADAPTER arrives as a burst of
+        // exactly these, with every headset wearing a new id.
+        HealStoredDeviceRefs(L"devices changed");
         m_engine.OnDeviceSetChanged();
+        // The endpoints have moved, so the session registrations have to
+        // follow them: a headset that just connected has a session manager
+        // nobody is registered with, and an app starting on it would go
+        // unnoticed (fj#1).
+        m_sessions.Rebind();
         // The device set moving is exactly when an app can end up on a dead
         // endpoint: the channel recovers by name, its apps do not (fj#1).
         ReconcileRouting(L"devices changed");
@@ -118,10 +187,42 @@ bool AppController::Start(HINSTANCE hInstance) {
         // keeps the row it had, status text and all.
         m_window.RebuildPages();
     };
-    m_uiCtx.dispatchIpc = [this](const std::wstring& msg, bool* sub) {
-        return HandleProtocolMessage(msg, *this, sub);
+    m_uiCtx.dispatchIpc = [this](const std::wstring& msg, bool* sub, int* intervalMs) {
+        return HandleProtocolMessage(msg, *this, sub, intervalMs);
     };
     m_uiCtx.routingAvailable = [this] { return m_policy.IsAvailable(); };
+    // A device asking to be let in. The window raises the dialog; this only logs
+    // that it was asked, so the log tells the same story as the screen did.
+    m_uiCtx.vbanAuthRequested = [](const std::wstring& id, const std::wstring& name) {
+        Log(2, L"vban: '%s' (%s) is asking for access", name.c_str(), id.c_str());
+    };
+    // What the person said.
+    m_uiCtx.vbanAuthResult = [this](const std::wstring& id, bool allow) {
+        m_vban.AuthorizationResult(id, allow);
+        Log(2, L"vban: access for '%s' was %s", id.c_str(), allow ? L"allowed" : L"refused");
+    };
+    // The prompt was dismissed without an answer. Forget that the device was
+    // asked about -- but do NOT deny it -- so a re-sent AUTH prompts again.
+    m_uiCtx.vbanAuthDismissed = [this](const std::wstring& id) {
+        m_vban.ForgetDevice(id);
+        Log(2, L"vban: access prompt for '%s' was dismissed; it may ask again", id.c_str());
+    };
+    // A deferred socket-rebinding apply (see SetVbanOption / kVbanApplyMsg).
+    m_uiCtx.vbanApply = [this] { ApplyVbanConfig(); };
+    // One that has just been authorized: remember it, so the next connection from
+    // it is instant rather than another prompt.
+    m_uiCtx.vbanDeviceAuthorized = [this](const std::wstring& id, const std::wstring& name) {
+        SYSTEMTIME lt = {};
+        GetLocalTime(&lt);
+        wchar_t when[32];
+        swprintf(when, 32, L"%04d-%02d-%02d %02d:%02d", lt.wYear, lt.wMonth, lt.wDay,
+                 lt.wHour, lt.wMinute);
+        bool changed = false;
+        m_store.Mutate([&](MixerConfig& c) {
+            changed = UpsertAuthorizedDevice(c.vban.authorizedDevices, id, name, when);
+        });
+        if (changed) Log(2, L"vban: remembered '%s' (%s)", name.c_str(), id.c_str());
+    };
     Log(2, L"theme: %s (system dark=%d)", cfg.ui.theme.c_str(), SystemPrefersDark() ? 1 : 0);
     m_theme.Rebuild(ResolveTheme(cfg.ui.theme, SystemPrefersDark()));
     m_uiCtx.theme = [this]() -> const ThemeState* { return &m_theme; };
@@ -137,22 +238,34 @@ bool AppController::Start(HINSTANCE hInstance) {
 
     std::wstring pipeErr;
     HWND hwnd = m_window.Hwnd();
-    bool pipeOk = m_pipe.Start([hwnd](const std::wstring& msg, bool* sub) {
-        // Pipe client thread: marshal onto the UI thread so control stays
-        // single-threaded. SendMessageTimeout, not SendMessage: a UI thread that
-        // is busy, modal, or shutting down must never park a pipe thread
-        // indefinitely (ABORTIFHUNG returns rather than waiting on a hung queue).
-        MainWindow::IpcRequest req{ &msg, sub, {} };
-        DWORD_PTR unused = 0;
-        if (!SendMessageTimeoutW(hwnd, MainWindow::kIpcMsg, (WPARAM)&req, 0,
-                                 SMTO_ABORTIFHUNG | SMTO_NORMAL, 5000, &unused))
-            return std::vector<std::wstring>{ L"MDXM_ERR|msg=busy" };
-        return req.replies;
+    bool pipeOk = m_pipe.Start([hwnd](const std::wstring& msg, bool* sub, int* intervalMs) {
+        return DispatchToUi(hwnd, msg, sub, intervalMs);
     }, &pipeErr);
     if (!pipeOk) Log(1, L"pipe server: %s", pipeErr.c_str());
 
+    // The VBAN listener, if it is switched on. Unlike the shared-memory feed
+    // this one PERSISTS across restarts: the point of the feature is that the
+    // phone can subscribe at any moment without anyone touching the PC. What
+    // stays on demand is emission -- TickVban keeps the engine's ring write
+    // following whether anybody is actually listening.
+    ApplyVbanConfig();
+
     // Signal-only (fj#401): the notification callback only posts.
     m_watcher.Start([hwnd] { PostMessageW(hwnd, MainWindow::kDeviceChangeMsg, 0, 0); });
+
+    // An app starting to play is the moment a stored assignment becomes
+    // writable, because Windows keys per-app routing by process id (fj#1).
+    // Same contract as the device watcher: the callback only posts, and the
+    // reconcile happens on the UI thread after a debounce.
+    //
+    // Started AFTER the pipe and the device watcher, and before the startup
+    // reconcile below, so nothing that begins playing during startup falls
+    // between the two.
+    if (m_sessions.Start([hwnd] { PostMessageW(hwnd, MainWindow::kSessionChangeMsg, 0, 0); }))
+        Log(2, L"session watcher: %d endpoint(s)", m_sessions.Registered());
+    else
+        Log(1, L"session watcher did not start; stored app routes will be applied "
+               L"on device changes and at startup only");
 
     // fj#1: apply the stored app assignments to whatever is already playing.
     // Windows persists a per-app route itself, so this is usually a no-op --
@@ -171,7 +284,14 @@ bool AppController::Start(HINSTANCE hInstance) {
 
 void AppController::Stop() {
     m_watcher.Stop();
+    // Before the pipe and the engine: it owns a thread that holds COM
+    // references into the audio stack, and those have to be let go while
+    // there is still an audio stack to let go of.
+    m_sessions.Stop();
     m_pipe.Stop();
+    // Before the engine: the sender thread reads the engine's ring, so it has to
+    // be finished before the engine it borrows from goes away.
+    m_vban.Stop();
     m_engine.Stop();
     m_store.FlushNow();
     m_window.Destroy();
@@ -220,8 +340,23 @@ void AppController::BroadcastState() {
 // This is also why it is a pushed record and not something a client polls.
 // MDXM_STATE is a full state block; polling one four times a second to watch a
 // number move is exactly what section 7 of docs/ipc.md says not to do.
-void AppController::PushPeaks() {
-    if (!m_pipe.HasSubscribers()) return;
+void AppController::PushToSubscribers() {
+    const bool subscribed = m_pipe.HasSubscribers();
+    if (subscribed) {
+        // Nobody is owed a push yet. This runs on the 100 ms timer so that a
+        // client asking for 100 ms can have it; a client on the default 250
+        // simply is not due on two ticks out of three, and the cost of
+        // noticing that is one lock and a comparison.
+        if (!m_pipe.AnySubscriberDue((unsigned)GetTickCount())) return;
+    }
+    if (!subscribed) {
+        // Forget what was pushed, so the next client to subscribe is handed
+        // the whole device list rather than the tail of a conversation it was
+        // not part of.
+        if (m_hadSubscribers) { m_hadSubscribers = false; m_pushedDevs.clear(); }
+        return;
+    }
+    m_hadSubscribers = true;
     // Half a tick's grace. The mixer tab's own 250 ms refresh runs on the same
     // timer message as this does, so when the window is visible one of the two
     // has almost always just swept; sweeping again would double the rate of the
@@ -232,7 +367,61 @@ void AppController::PushPeaks() {
     const bool fresh = m_lastSweepMs != 0 && (now - m_lastSweepMs) < 125 &&
                        !m_lastLevels.empty();
     const auto& levels = fresh ? m_lastLevels : (m_lastLevels = GetDeviceLevels());
-    m_pipe.Broadcast(PeakRecord(GetChannels(), levels));
+    // One `now` for the whole push: the records go to whoever is due at that
+    // instant, and exactly those clients have their next due time advanced.
+    // See PipeServer's AnySubscriberDue / BroadcastDue / MarkPushed.
+    m_pipe.BroadcastDue(PeakRecord(GetChannels(), levels), now);
+    PushDeviceRows(levels, now);
+    m_pipe.MarkPushed(now);
+}
+
+// Device rows to anyone listening (fj#7).
+//
+// BroadcastState pushes MDXM_CHAN per channel and one MDXM_ROUTE, and that was
+// all: a subscriber never learned that a DEVICE row had changed -- an
+// endpoint's volume, its mute, whether it went active or away, its battery.
+// So a front-end delegating its device list to MDXM_DEVLVL had to go on
+// polling MDXM_STATE, which section 7 of the ipc doc tells it not to do, for
+// the right reason: on this machine that block is seven channel rows plus
+// eighty-odd device rows. It is the same fault BroadcastState's own comment
+// records about Sonar channels -- a row that appears on a poll and then never
+// moves for a subscriber -- one record along.
+//
+// WHY THIS RUNS ON THE SWEEP RATHER THAN ON EVENTS. The issue asked for device
+// arrival and loss to come from IMMNotificationClient and for volume and mute
+// changes to be "already observed". Only the first is true: nothing in this
+// program is told when a Windows volume moves, a battery falls, or an endpoint
+// goes inactive -- those are read by the sweep and in no other way. An
+// event-driven push would therefore cover a subset of the changes and need its
+// own sweeps to format a row, while this sweep is already running, is already
+// paid for by the peak push, and runs ONLY while a client is subscribed. The
+// sweep is the event. Latency is one tick, 250 ms, which is below the rate any
+// of this is drawn at.
+//
+// What is NOT done here is the thing a timer would get wrong: nothing is sent
+// when nothing changed. Every row is diffed against what the subscriber was
+// last told, peak excluded (SameDeviceRow) -- peaks move constantly and travel
+// on MDXM_PEAK, so including them would turn this into eighty records four
+// times a second saying nothing.
+void AppController::PushDeviceRows(const std::vector<DeviceLevel>& levels, unsigned nowMs) {
+    // Has the SET of rows changed, or their order? A client with a control per
+    // row has to rebuild its controls then, and only then -- MDropDX12's
+    // window does exactly that, and updates values otherwise. A removal is
+    // also the one change no row can carry: a device that has gone has no row
+    // to push, so without this record nothing would say so.
+    bool setChanged = m_pushedDevs.size() != levels.size();
+    for (size_t i = 0; !setChanged && i < levels.size(); ++i)
+        if (m_pushedDevs[i].id != levels[i].id) setChanged = true;
+
+    if (setChanged) {
+        m_pipe.BroadcastDue(DeviceSetRecord(levels), nowMs);
+        for (const auto& d : levels) m_pipe.BroadcastDue(DeviceRecord(d), nowMs);
+    } else {
+        for (size_t i = 0; i < levels.size(); ++i)
+            if (!SameDeviceRow(m_pushedDevs[i], levels[i]))
+                m_pipe.BroadcastDue(DeviceRecord(levels[i]), nowMs);
+    }
+    m_pushedDevs = levels;
 }
 
 std::vector<ChannelState> AppController::GetChannels() {
@@ -296,6 +485,8 @@ std::vector<ChannelState> AppController::GetChannels() {
         if (sonarPeaksFresh) {
             auto it = m_sonarPeaks.find(c.key);
             if (it != m_sonarPeaks.end()) s.peak = it->second;
+            auto nit = m_sonarPeaksNow.find(c.key);
+            if (nit != m_sonarPeaksNow.end()) s.peakNow = nit->second;
         }
         out.push_back(s);
     }
@@ -376,6 +567,72 @@ bool AppController::EnableEq(const std::wstring& ch, bool on) {
     return true;
 }
 
+// Where apps routed to this channel actually go.
+//
+// Apps are routed INTO the cable: its render side when one is configured, and
+// a render endpoint bound as the channel SOURCE (the loopback tap) also works
+// -- mirroring a Sonar channel is exactly that case. Null when the channel has
+// nowhere to send right now, which is a cable that is unplugged rather than an
+// error.
+//
+// One copy, because there are three callers -- assignment, the reconciler, and
+// the drift column on the Routing tab -- and a fourth answer to "where does
+// this channel send" is how a UI comes to disagree with what was written.
+static const EndpointInfo* RoutableEndpointFor(const ChannelConfig& c,
+                                               const std::vector<EndpointInfo>& eps) {
+    if (const EndpointInfo* ep = MatchBinding(eps, c.cable.render)) return ep;
+    const EndpointInfo* ep = MatchBinding(eps, c.cable.capture);
+    return (ep && ep->isRender) ? ep : nullptr;
+}
+
+// Are these apps where they are supposed to be? (fj#1 item 4.)
+//
+// ONE endpoint enumeration for the whole list. The Routing tab asks about
+// every row it draws, and a sweep per row would be twenty of them per refresh
+// on this machine -- on the call path that faulted inside AudioSes.dll while
+// headsets came and went. The per-app part that remains is a policy read,
+// which is keyed by pid and genuinely is per row.
+std::vector<AppRouteState> AppController::GetAppRoutes(
+    const std::vector<std::pair<std::wstring, unsigned long>>& apps) {
+    std::vector<AppRouteState> out;
+    out.reserve(apps.size());
+    const bool available = m_policy.IsAvailable();
+    const auto eps = EnumerateEndpoints();
+
+    // Each channel resolved once, rather than once per app on it.
+    // The exe path is COPIED rather than pointed at inside the config. The
+    // store does hand out a reference that would stay valid for this call, but
+    // a list of pointers into someone else's container is a lifetime trap for
+    // the next person to touch this, and a handful of paths is nothing.
+    struct Claim { std::wstring exe, channel, endpointId; };
+    std::vector<Claim> claims;
+    for (const auto& c : m_store.Get().channels) {
+        if (c.apps.empty()) continue;
+        const EndpointInfo* ep = RoutableEndpointFor(c, eps);
+        for (const auto& app : c.apps)
+            claims.push_back({ app, c.name.empty() ? c.id : c.name,
+                               ep ? ep->id : std::wstring() });
+    }
+
+    for (const auto& a : apps) {
+        AppRouteState s;
+        s.available = available;
+        for (const auto& cl : claims)
+            if (_wcsicmp(cl.exe.c_str(), a.first.c_str()) == 0) {
+                s.intendedChannel = cl.channel;
+                s.intendedEndpointId = cl.endpointId;
+                break;
+            }
+        // Only worth asking Windows about an app something actually claims:
+        // an unassigned app's route is not mdxmixer's business, and this is a
+        // COM round trip per row.
+        if (available && a.second != 0 && !s.intendedChannel.empty())
+            m_policy.GetPersistedDefaultRender(a.second, &s.actualEndpointId);
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
 bool AppController::AssignApp(const std::wstring& exePath, const std::wstring& chOrDash) {
     bool clearing = (chOrDash == L"-");
     std::wstring targetEndpoint;
@@ -384,14 +641,8 @@ bool AppController::AssignApp(const std::wstring& exePath, const std::wstring& c
         for (const auto& c : m_store.Get().channels)
             if (c.id == chOrDash) { target = &c; break; }
         if (!target) return false;
-        // Apps are routed INTO the cable: its render side when configured; a
-        // render endpoint bound as the channel source (loopback tap) also works.
         auto eps = EnumerateEndpoints();
-        const EndpointInfo* ep = MatchBinding(eps, target->cable.render);
-        if (!ep) {
-            ep = MatchBinding(eps, target->cable.capture);
-            if (ep && !ep->isRender) ep = nullptr;
-        }
+        const EndpointInfo* ep = RoutableEndpointFor(*target, eps);
         if (!ep) {
             Log(1, L"assign: channel %s has no routable render endpoint", chOrDash.c_str());
             return false;
@@ -448,11 +699,7 @@ void AppController::ReconcileRouting(const wchar_t* why) {
     std::vector<RouteIntent> intents;
     for (const auto& c : m_store.Get().channels) {
         if (c.apps.empty()) continue;
-        const EndpointInfo* ep = MatchBinding(eps, c.cable.render);
-        if (!ep) {
-            ep = MatchBinding(eps, c.cable.capture);
-            if (ep && !ep->isRender) ep = nullptr;
-        }
+        const EndpointInfo* ep = RoutableEndpointFor(c, eps);
         for (const auto& app : c.apps)
             intents.push_back({ app, c.id, ep ? ep->id : std::wstring() });
     }
@@ -623,9 +870,17 @@ void ApplyDeviceView(MixerConfig& cfg, std::vector<DeviceLevel>& levels,
                 d.autoPinned = true;
                 continue;
             }
-            for (const auto& e : allow)
-                if ((!e.id.empty() && e.id == d.id) ||
-                    (!e.name.empty() && e.name == d.name)) { d.autoPinned = true; break; }
+            // SameDevice, the same rule the devices tab draws with and the
+            // failover watcher commits on. It was id-or-name here, id-only
+            // there, and name-or-id in the engine: three readings of one list.
+            const DeviceRefKeys dev{ d.id, d.name,
+                                     AliasOrNone(d.displayName, d.name), d.btAddress };
+            for (const auto& e : allow) {
+                const DeviceRefKeys ref{
+                    e.id, e.name,
+                    AliasOrNone(AliasFor(names, e.id, L"", e.name), e.name), e.btAddress };
+                if (SameDevice(ref, dev)) { d.autoPinned = true; break; }
+            }
         }
     }
     // Sorted here rather than in each surface, so the mixer list, the failover
@@ -633,8 +888,71 @@ void ApplyDeviceView(MixerConfig& cfg, std::vector<DeviceLevel>& levels,
     SortDevices(levels);
 }
 
-std::vector<DeviceLevel> AppController::GetDeviceLevels() {
+// Teach every stored device reference what the devices in front of it know.
+//
+// "I would prefer to not have to guess every time I change out the bluetooth
+// adapter hoping for a better and more stable connection." A new dongle
+// re-pairs every headset, so every stored endpoint id and ContainerId dies in
+// one afternoon and Windows renames the devices on top of that. The one anchor
+// that survives is the headset's own Bluetooth address -- so each entry picks
+// it up the first time it is seen beside its device, and from then on the swap
+// costs nothing.
+//
+// NOT a cleanup the user has to run. It writes only better anchors onto
+// entries that already match, never removes one and never touches an alias,
+// which is why it is safe to do unprompted: "I never touched the remove
+// unknown button as I have enough of a time keeping things solid as
+// development changes happen".
+//
+// Runs at startup and on the debounced device change -- the two moments the
+// device set is new -- and not on the sweep, which would ask to write the
+// config file ten times a second.
+void AppController::HealStoredDeviceRefs(const wchar_t* why) {
     auto levels = ListEndpointVolumes();
+    if (levels.empty()) return;
+    MixerConfig& live = m_store.Get();
+    auto keysFor = [&](const DeviceLevel& d) {
+        const std::wstring alias =
+            DisplayName(live.deviceNames, d.id, d.containerId, d.name, d.btAddress);
+        return DeviceRefKeys{ d.id, d.name, AliasOrNone(alias, d.name), d.btAddress };
+    };
+    std::vector<DeviceRefKeys> devs;
+    devs.reserve(levels.size());
+    for (const auto& d : levels) devs.push_back(keysFor(d));
+
+    int healed = 0;
+    m_store.Mutate([&](MixerConfig& c) {
+        auto heal = [&](DeviceRef& e) {
+            if (e.id == kFollowFailover) return;   // a mode, not a device
+            DeviceRefKeys ref{ e.id, e.name,
+                               AliasOrNone(AliasFor(c.deviceNames, e.id, L"", e.name), e.name),
+                               e.btAddress };
+            for (const auto& dev : devs) {
+                if (!SameDevice(ref, dev)) continue;
+                if (HealDeviceRef(ref, dev)) {
+                    e.id = ref.id;
+                    e.name = ref.name;
+                    e.btAddress = ref.btAddress;
+                    ++healed;
+                }
+                return;
+            }
+        };
+        for (auto& e : c.personalFailover.allow) heal(e);
+        heal(c.personalOutput);
+    });
+    if (healed > 0)
+        Log(2, L"device references healed (%s): %d entr%s now carry current anchors",
+            why, healed, healed == 1 ? L"y" : L"ies");
+}
+
+std::vector<DeviceLevel> AppController::GetDeviceLevels() {
+    // Hidden endpoints are swept for their identity alone, which on this
+    // machine is 16 VBMatrix rows nobody looks at out of 53 endpoints. The
+    // set comes from the LAST sweep, because "hidden" is resolved from the
+    // name and container this sweep produces (sweep_selection.h): a device
+    // hidden a moment ago is read in full once more and then goes quiet.
+    auto levels = ListEndpointVolumes(m_identityOnlyIds);
     // The LIVE route, from the engine — not cfg.personalOutput, which is what
     // was asked for. Failover can have moved us somewhere else since, and the
     // row worth hoisting is the one actually carrying the audio.
@@ -688,10 +1006,34 @@ void AppController::HoldDevicePeaks(std::vector<DeviceLevel>& levels) {
     // While the whole list with its names and its held peaks is in hand, do
     // the Sonar join. GetChannels reads the result; see m_sonarPeaks.
     m_sonarPeaks.clear();
+    m_sonarPeaksNow.clear();
     for (const wchar_t* key : { L"aux", L"media", L"game",
-                                L"chatRender", L"chatCapture" })
+                                L"chatRender", L"chatCapture" }) {
         m_sonarPeaks[key] = SonarChannelPeak(levels, key);
+        // The unheld figure too: the Mixer tab's meters fall at their own rate
+        // rather than inheriting the wire's 1.5 s hold.
+        m_sonarPeaksNow[key] = SonarChannelPeakNow(levels, key);
+    }
     m_sonarPeaksMs = now;
+
+    // Which endpoints the NEXT sweep may read identity alone for. Computed
+    // here because this is where `hidden` has just been resolved, and kept as
+    // ids because that is what the sweep can test cheaply.
+    //
+    // The Sonar prefix is passed in rather than known by the device layer: the
+    // meters above are joined onto those endpoints by name, so hiding one in
+    // the device list must not silently kill a channel meter in the mixer.
+    {
+        std::vector<std::wstring> routes;
+        const DiagState diag = m_engine.GetDiag();
+        if (!diag.personalDevice.empty()) routes.push_back(diag.personalDevice);
+        for (const auto& c : m_store.Get().channels) {
+            if (!c.cable.render.id.empty()) routes.push_back(c.cable.render.id);
+            if (!c.cable.capture.id.empty()) routes.push_back(c.cable.capture.id);
+        }
+        m_identityOnlyIds =
+            IdentityOnlyIds(levels, routes, { L"SteelSeries Sonar - " });
+    }
 
     m_lastLevels = levels;
 }
@@ -711,7 +1053,243 @@ bool AppController::SetFeedEnabled(bool on, std::wstring* err) {
 bool AppController::FeedEnabled() { return m_engine.FeedEnabled(); }
 uint32_t AppController::FeedRate() { return m_engine.FeedRate(); }
 
+// ── The VBAN stream server ───────────────────────────────────────────────
+
+void AppController::ApplyVbanConfig() {
+    const VbanConfig v = m_store.Get().vban;
+    // The PC's own share of what the listener hears late is cushion + one packet
+    // + the sender's wake. The BASE is just the parts the server cannot see --
+    // the engine's cushion and a ~2 ms wake margin; the server adds the real
+    // packet duration itself (it knows the format and rate). Folding a packet
+    // estimate in here too, as this first did, double-counted it by ~5 ms.
+    m_vban.SetSrcLatencyBase(m_engine.CushionMs() + 2);
+    if (!v.enabled) {
+        m_vban.Stop();
+        m_engine.SetVbanSink(false, v.sourceStreaming);
+        return;
+    }
+    if (m_vban.Running()) {
+        m_vban.UpdateConfig(v);
+    } else {
+        const HWND hwnd = m_window.Hwnd();
+        VbanServer::Callbacks cb;
+        // A record from the network goes through the SAME marshalling as one from
+        // the pipe, so control stays single-threaded whatever carried it.
+        cb.dispatch = [hwnd](const std::wstring& msg) {
+            return DispatchToUi(hwnd, msg, nullptr, nullptr);
+        };
+        // Both of these arrive on the receive thread, so they only POST.
+        cb.onAuthPending = [hwnd](const std::wstring& id, const std::wstring& name) {
+            // Heap-owned, deleted by the handler: the receive thread must not
+            // wait for a dialog the user may leave on screen for minutes.
+            auto* text = new std::wstring(id + L"\n" + name);
+            if (!PostMessageW(hwnd, MainWindow::kVbanAuthMsg, 0, (LPARAM)text))
+                delete text;
+        };
+        cb.onAuthorized = [hwnd](const std::wstring& id, const std::wstring& name) {
+            auto* text = new std::wstring(id + L"\n" + name);
+            if (!PostMessageW(hwnd, MainWindow::kVbanAuthorizedMsg, 0, (LPARAM)text))
+                delete text;
+        };
+        std::wstring err;
+        if (!m_vban.Start(v, &m_engine.VbanRing(), m_engine.MixRate(), cb, &err)) {
+            // Logged and carried: a mixer whose network stream did not start is
+            // still a working mixer, and the reason is in MDXM_VBANSTATE for
+            // anyone who asks.
+            Log(1, L"vban did not start: %s", err.c_str());
+            m_engine.SetVbanSink(false, v.sourceStreaming);
+            return;
+        }
+    }
+    TickVban();
+}
+
+void AppController::TickVban() {
+    // The receive socket died for a reason that was not us (a resume that left
+    // it dead, an adapter pulled). The server cannot rebuild itself -- Stop()
+    // keys its thread joins on the still-true running flag -- so the control
+    // layer does it: a full Stop/Start, which the config re-apply performs.
+    if (m_vban.Running() && m_vban.Failed()) {
+        Log(1, L"vban: receive socket failed; rebuilding the server");
+        m_vban.Stop();
+        ApplyVbanConfig();
+        return;
+    }
+    if (!m_vban.Running()) {
+        if (m_engine.VbanSinkOn()) m_engine.SetVbanSink(false, false);
+        return;
+    }
+    // The clock master can change rate under us (a different personal output
+    // device), and the rate is in every packet header -- a sender left on the old
+    // one would have the far end play at the wrong speed, which sounds like a
+    // fault in the music rather than a configuration problem. Cheap: the server
+    // returns at once when the rate has not moved.
+    m_vban.UpdateMixRate(m_engine.MixRate());
+    // THE SINK FOLLOWS DEMAND, NOT CONFIG. An enabled listener with nobody
+    // connected must not cost a copy per audio block -- that is the same "do not
+    // publish what nobody asked for" rule the shared-memory feed follows, and the
+    // reason the engine's demand bit cannot be trusted to do it (mix_demand.h).
+    //
+    // Pushed UNCONDITIONALLY, not only on a demand change: the source
+    // (personal/streaming) can switch while the stream is up, and SetVbanSink
+    // stores it on every call (the engine early-returns when nothing changed, so
+    // this is cheap). Gating on `wanted != VbanSinkOn()` alone let a live
+    // `source=streaming` be acknowledged while the wire kept carrying the
+    // personal sum until every listener left and came back.
+    m_engine.SetVbanSink(m_vban.Wanted(), m_store.Get().vban.sourceStreaming);
+}
+
+VbanStatus AppController::GetVbanStatus() {
+    VbanStatus s = m_vban.Status();
+    // When the server is stopped its own snapshot cannot say what the config
+    // wants, and a reader asking "is this on?" means the setting, not the socket.
+    if (!m_vban.Running()) {
+        const VbanConfig& v = m_store.Get().vban;
+        s.on = v.enabled;
+        s.port = v.port;
+        s.name = v.streamName;
+        s.sourceStreaming = v.sourceStreaming;
+        s.formatFloat32 = v.formatFloat32;
+        s.gainPercent = v.gainPercent;
+        s.fps = v.frames.fps;
+        s.open = v.openSubscribe;
+        s.always = v.alwaysStream;
+        s.alwaysFrames = v.alwaysFrames;
+        s.target = v.alwaysStreamTarget;
+    }
+    return s;
+}
+
+std::vector<VbanPeerRow> AppController::GetVbanPeers() { return m_vban.Peers(); }
+
+bool AppController::RevokeVbanDevice(const std::wstring& deviceId) {
+    bool removed = false;
+    m_store.Mutate([&](MixerConfig& c) {
+        removed = RemoveAuthorizedDevice(c.vban.authorizedDevices, deviceId);
+    });
+    // Told to the server directly as well as removed from config: a session it is
+    // no longer entitled to must end now rather than at the next config push, and
+    // the server's own approval memory has to forget it too or the next AUTH would
+    // still succeed from that.
+    //
+    // FORGET rather than deny. A revoke is not the same statement as a refusal:
+    // the device should be able to ask again -- the next AUTH gets `pending` and
+    // raises the prompt -- whereas a denial is terminal until restart.
+    m_vban.ForgetDevice(deviceId);
+    if (removed) Log(2, L"vban: revoked access for '%s'", deviceId.c_str());
+    return removed;
+}
+
+bool AppController::SetVbanOption(const std::wstring& key, const std::wstring& value,
+                                  std::wstring* err) {
+    const auto fail = [err](const wchar_t* why) {
+        if (err) *err = why;
+        return false;
+    };
+    const auto parseBool = [](const std::wstring& v, bool* out) {
+        if (v == L"0") { *out = false; return true; }
+        if (v == L"1") { *out = true; return true; }
+        return false;
+    };
+    // '|' and '=' are the record's own delimiters: a value carrying either one
+    // corrupts every MDXM_VBANSTATE that echoes it, for every reader. The free-
+    // text fields (name, target) are the only ones that could, so they are
+    // refused here.
+    const auto hasDelimiter = [](const std::wstring& s) {
+        return s.find(L'|') != std::wstring::npos || s.find(L'=') != std::wstring::npos;
+    };
+    // Edited as a copy and committed only once every field has been accepted, so
+    // a rejected value leaves nothing half-applied.
+    VbanConfig v = m_store.Get().vban;
+    bool b = false;
+    if (key == L"on") {
+        if (!parseBool(value, &b)) return fail(L"on wants 0 or 1");
+        v.enabled = b;
+    } else if (key == L"port") {
+        const int p = _wtoi(value.c_str());
+        if (p < 1 || p > 65535) return fail(L"port wants 1..65535");
+        v.port = p;
+    } else if (key == L"name") {
+        // 16 bytes is the field width on the wire, not a style choice.
+        if (value.empty() || value.size() > 16) return fail(L"name wants 1..16 characters");
+        if (hasDelimiter(value)) return fail(L"name cannot contain | or =");
+        v.streamName = value;
+    } else if (key == L"source") {
+        if (value != L"personal" && value != L"streaming")
+            return fail(L"source wants personal or streaming");
+        v.sourceStreaming = value == L"streaming";
+    } else if (key == L"format") {
+        if (value != L"i16" && value != L"f32") return fail(L"format wants i16 or f32");
+        v.formatFloat32 = value == L"f32";
+    } else if (key == L"gain") {
+        const int g = _wtoi(value.c_str());
+        if (g < 0 || g > 6400) return fail(L"gain wants 0..6400 percent");
+        v.gainPercent = g;
+    } else if (key == L"fps") {
+        const double f = _wtof(value.c_str());
+        if (f < 0.2 || f > 10.0) return fail(L"fps wants 0.2..10");
+        v.frames.fps = f;
+    } else if (key == L"open") {
+        if (!parseBool(value, &b)) return fail(L"open wants 0 or 1");
+        v.openSubscribe = b;
+    } else if (key == L"always") {
+        if (!parseBool(value, &b)) return fail(L"always wants 0 or 1");
+        v.alwaysStream = b;
+    } else if (key == L"alwaysframes") {
+        if (!parseBool(value, &b)) return fail(L"alwaysframes wants 0 or 1");
+        v.alwaysFrames = b;
+    } else if (key == L"target") {
+        // Shape is not validated here -- the server parses it, says so in
+        // lastError when it cannot, and treats a bad one as absent, so a typo
+        // does not lock the user out of fixing it. But the record delimiters are
+        // refused, because a target carrying one corrupts MDXM_VBANSTATE.
+        if (hasDelimiter(value)) return fail(L"target cannot contain | or =");
+        v.alwaysStreamTarget = value;
+    } else if (key == L"pin") {
+        v.pin = value;
+    } else {
+        if (err) *err = L"unknown vban option: " + key;
+        return false;
+    }
+    m_store.Mutate([&](MixerConfig& c) { c.vban = v; });
+    // on/port rebind the socket. Apply them DEFERRED -- posted back to the UI
+    // pump -- because a network-carried MDXM_VBAN|port= runs on the UI thread
+    // while the VBAN receive thread is blocked in DispatchToUi waiting for THIS
+    // handler to return; applying inline, ApplyVbanConfig -> Stop() would join
+    // that blocked thread (3 s timeout, a leaked handle, and for a port change a
+    // second receive thread left on the same socket). The post runs the rebuild
+    // after this returns and the receive thread is unblocked, and the reply still
+    // leaves on the old socket first. Every other key applies inline.
+    if (key == L"on" || key == L"port")
+        PostMessageW(m_window.Hwnd(), MainWindow::kVbanApplyMsg, 0, 0);
+    else
+        ApplyVbanConfig();
+    return true;
+}
+
+int AppController::GetCushionMs() { return m_engine.CushionMs(); }
+int AppController::GetCushionHeadroomPercent() { return m_engine.CushionHeadroomPercent(); }
+int AppController::GetCushionFlatMs() { return m_engine.CushionFlatMs(); }
+
+// Live AND persisted: the engine re-cushions now, and the values survive a
+// restart so an experiment that lands on good numbers does not have to be
+// repeated (fj#12).
+bool AppController::SetCushion(int ms, int headroomPercent, int flatMs) {
+    if (!m_engine.SetCushion(ms, headroomPercent, flatMs)) return false;
+    m_store.Mutate([&](MixerConfig& c) {
+        c.cushionMs = m_engine.CushionMs();
+        c.cushionHeadroomPercent = m_engine.CushionHeadroomPercent();
+        c.cushionFlatMs = m_engine.CushionFlatMs();
+    });
+    BroadcastState();
+    return true;
+}
+
 FailoverConfig AppController::GetFailover() { return m_store.Get().personalFailover; }
+
+// The rule comes from config; what the watcher is doing with it comes from the
+// engine, which is the only thing that has it (fj#2 §3).
+FailoverStatus AppController::GetFailoverStatus() { return m_engine.GetFailoverStatus(); }
 
 bool AppController::SetFailoverArmed(bool armed) {
     m_store.Mutate([&](MixerConfig& c) { c.personalFailover.armed = armed; });
@@ -925,6 +1503,19 @@ bool AppController::SetDeviceView(const std::wstring& endpointId,
                 BluetoothAddressOf(endpointId));
     });
     Log(2, L"device view: %s hidden=%d pinned=%d", windowsName.c_str(), (int)hidden, (int)pinned);
+    // WHICH rows exist has changed, so the window is rebuilt here rather than
+    // by whoever called — which is what makes hiding work in both directions
+    // (fj#8). A hide arriving over the pipe has to file the device away in
+    // mdxmixer's own window, and the 250 ms refresh tick cannot do it: it
+    // updates the values in rows that already exist and can neither add a row
+    // nor remove one.
+    //
+    // The Mixer tab's own right-click Hide used to rebuild itself and nothing
+    // else did, so there were two paths to the same state. Now there is one,
+    // and it is the same principle the tray menu and the Options tab already
+    // share for "Show in taskbar": one command, one handler, no second way for
+    // the two to disagree.
+    m_window.RebuildPages();
     BroadcastState();
     return true;
 }
@@ -972,7 +1563,8 @@ std::wstring AppController::GetHotkeyStatus(const std::wstring& bindingId) {
 bool AppController::ShowTab(const std::wstring& name) {
     std::wstring want;
     for (wchar_t c : name) want += (wchar_t)towlower(c);
-    static const wchar_t* kTabs[] = { L"mixer", L"routing", L"eq", L"devices", L"options" };
+    static const wchar_t* kTabs[] = { L"mixer", L"routing", L"eq", L"devices",
+                                      L"vban", L"options" };
     for (int i = 0; i < (int)(sizeof kTabs / sizeof kTabs[0]); ++i)
         if (want == kTabs[i]) {
             m_window.SelectTab(i);

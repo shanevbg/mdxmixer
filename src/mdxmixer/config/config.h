@@ -11,7 +11,23 @@
 
 namespace mdxm {
 
-struct DeviceRef   { std::wstring id, name; };
+// A stored reference to one audio device.
+//
+// THE ADDRESS IS THE ONLY ANCHOR THAT SURVIVES A CHANGE OF ADAPTER, and that
+// is not a hypothetical on this machine: "I would prefer to not have to guess
+// every time I change out the bluetooth adapter hoping for a better and more
+// stable connection". Swapping dongles re-pairs every headset, which mints a
+// new endpoint id AND a new ContainerId for each one, and Windows renames them
+// too -- the same earbuds come back as "Headphones (12- WF-1000XM5)" where they
+// were "(11- ...)". So an entry keyed on id and name alone is dead on arrival
+// after a swap, which is how one failover list came to hold 21 entries for
+// seven headsets.
+//
+// The Bluetooth address belongs to the HEADSET, not to the pairing, so it
+// survives. It is empty for anything not on Bluetooth and for entries written
+// before this field existed; those are filled in by HealDeviceRefs the first
+// time the entry is matched to a live device.
+struct DeviceRef   { std::wstring id, name, btAddress; };
 
 // personalOutput.id when the route is not bound to a device at all, but
 // follows the failover list: whichever allowed device is present wins, and a
@@ -52,6 +68,24 @@ struct UiConfig    { // A taskbar button as well as the tray icon. ON by
                      // and with it on, minimising goes to the taskbar instead
                      // of hiding.
                      bool taskbarButton = true;       // JSON: "ui": { "taskbarButton": .., "theme": .. }
+                     // The sticky tack: keep the window above everything else.
+                     //
+                     // MDropDX12 puts this pin on all twenty-odd of its tool
+                     // windows and defaults it ON there, because a tool window
+                     // is small and is opened to be watched. This is the whole
+                     // mixer, so it defaults OFF -- a full window forcing
+                     // itself over everything on first run is a surprise, and
+                     // one click makes it stick for good.
+                     bool alwaysOnTop = false;
+                     // Which tab was open when the window was last used.
+                     //
+                     // Saved on a USER tab change only, never when a tab is
+                     // selected by MDXM_TAB: a script taking a screenshot of
+                     // the Devices page must not rewrite where the window
+                     // opens tomorrow. Clamped on load, so a config naming a
+                     // tab that no longer exists opens on the Mixer rather
+                     // than on nothing.
+                     int activeTab = 0;
                      // Fader control: sliders, or step buttons. MDropDX12's
                      // own option, down to the name -- its Options tab reads
                      // "Fader control: sliders, or spin boxes that step by one
@@ -115,6 +149,21 @@ struct BatteryOverlayConfig {
     // cannot be dragged, so turning this OFF is how it gets moved, and the X
     // and Y boxes in Options move it either way.
     bool clickThrough = true;
+    // Adapt to MDropDX12's watermark instead of competing with it.
+    //
+    // ON by default, because it is what makes the overlay behave when the two
+    // programs run together -- which on this machine is most of the time. Two
+    // things hang off it, both described in ui/topmost.h: mdx12's topmost
+    // windows are FOLLOWED rather than raised over, so neither program spends
+    // the day shoving the other down a shared band; and while the watermark is
+    // actually over the overlay, its opacity is lifted by 30% of itself
+    // (between 40 and 80 only) to pay for being read through a 30%-opaque
+    // layer.
+    //
+    // Off is a real choice, not a safety valve: it makes the overlay compete
+    // like any other topmost window, which is what someone who wants the
+    // battery readout above everything -- watermark included -- would pick.
+    bool mdx12Adaptive = true;
     // A painted panel behind the text, or nothing at all. Off by default:
     // "only the text Batt: ##% will appear". Off is done with a colour key,
     // which is why the text is drawn without antialiasing in that mode — the
@@ -134,6 +183,73 @@ struct BatteryOverlayConfig {
     // $n  the full Windows name  $$  a literal dollar
     std::wstring text = L"Batt: $b%";
 };
+
+// The VBAN stream server (spec docs/specs/2026-10-07-vban-stream-server-design.md §6.1).
+//
+// A device that has been approved once, so the next connection from it is
+// instant rather than another prompt. Keyed on the id the phone mints for
+// itself, which is also what MDropDX12's TCP auth uses -- one approval concept
+// across both services. `name` is only ever shown to a person.
+struct VbanAuthorizedDevice { std::wstring id, name; std::wstring lastSeen; };
+
+// The display-capture stream: how often, how large, how compressed. Separate
+// from the audio settings because a person tuning picture quality is not
+// thinking about the monitor mix.
+struct VbanFramesConfig { double fps = 2.0; int quality = 60; int maxEdge = 480; };
+
+struct VbanConfig {
+    // OFF, and the listener only exists while it is on. This is the first
+    // inbound socket in the program, so it is opt-in -- but note that unlike
+    // the shared-memory feed, `enabled` PERSISTS: the point of the feature is
+    // that the phone can subscribe at any moment without anyone touching the
+    // PC, so the listener has to survive a restart. Emission does not: nothing
+    // is sent until a subscriber asks.
+    bool enabled = false;
+    int  port = 6980;                         // the spec's default
+    std::wstring bindAddress;                 // empty = any interface
+    std::wstring streamName = L"mdxmixer";    // <= 16 ASCII on the wire
+    // Which sum goes out. PERSONAL by default: the point is to hear what the
+    // headphones hear, per-channel balance and personal mutes included. The
+    // streaming sum is the programme mix and a different thing entirely.
+    bool sourceStreaming = false;
+    // int16 by default -- half the bandwidth and the format every VBAN
+    // receiver accepts. f32 is lossless and exists for the case where the
+    // makeup gain below is doing something extreme.
+    bool formatFloat32 = false;
+    // Makeup gain, applied PC-side before the wire. It goes to 6400% because
+    // the personal mix on this machine runs at a few percent of full scale --
+    // the faders ARE the listening level -- and sending that unamplified would
+    // put a 20-40 dB-down signal into a phone.
+    int  gainPercent = 100;                   // 0..6400
+    // Empty disables remote control entirely: no PIN, no TXT, and the
+    // authorized list below is inert. Discovery and (if opened) audio still
+    // work, which is a legal and deliberate "serve, but take no orders" state.
+    std::wstring pin;
+    std::vector<VbanAuthorizedDevice> authorizedDevices;
+    // Escape hatches for standard VBAN tools, which cannot authenticate
+    // because the protocol has no notion of it. Both off: subscription-by-ping
+    // is ours, and these are the two ways to serve software that only speaks
+    // the plain protocol.
+    bool openSubscribe = false;               // any pinger gets AUDIO, nothing else
+    bool alwaysStream = false;                // emit with no subscriber at all
+    bool alwaysFrames = false;                // ... and send display frames too
+    std::wstring alwaysStreamTarget;          // "ip:port"; empty = inert
+    VbanFramesConfig frames;
+};
+
+// Remember a device, or forget one. Pure, and shared by the approval callback and
+// the Revoke button so the two cannot drift: approving twice must not list a phone
+// twice (the Revoke list shows this, and two rows for one device is a trap -- which
+// one does Revoke remove?), and a renamed phone keeps its single row.
+//
+// Both return whether anything actually changed, so a caller can skip a config
+// write that would do nothing. An entry with no id is refused: it could never be
+// matched to a device and would sit in the list unreachable.
+bool UpsertAuthorizedDevice(std::vector<VbanAuthorizedDevice>& list,
+                            const std::wstring& id, const std::wstring& name,
+                            const std::wstring& lastSeen = std::wstring());
+bool RemoveAuthorizedDevice(std::vector<VbanAuthorizedDevice>& list,
+                            const std::wstring& id);
 
 // Where the main window was, and how big.
 //
@@ -190,8 +306,41 @@ struct MixerConfig {
     // default: the visualiser wants a full-level signal, which is the whole
     // reason it reads the streaming mix rather than the personal one.
     int  mdx12FeedPercent = 100;
+    // The FLOOR under the mix cushion, in milliseconds -- which is the
+    // latency, because the cushion is what the mix waits for before it starts
+    // draining a channel.
+    //
+    // A floor rather than the whole story: the cushion also adapts to the
+    // largest pull in the last minute, so a render that bursts is covered by
+    // that and is not what this governs (dsp/pull_window.h). This number is
+    // the headroom carried when the link is behaving -- measured on this
+    // machine, a WF-1000XM5 on a good link pulls a steady 480 frames, 10 ms,
+    // so 30 ms is three pulls of slack.
+    //
+    // Exposed because the right value is a property of the hardware and the
+    // radio environment, not something to hard-code: the honest way to find it
+    // is to lower it and watch `underruns` in MDXM_DIAG, which is why
+    // MDXM_CUSHION can set it live.
+    int  cushionMs = 30;
+    // The ADAPTIVE part of the cushion, which is what actually governs once
+    // the floor above is out of the way:
+    //
+    //     cushion = max( floor , pull + pull*headroom% + flat )
+    //
+    // `headroom` is proportional slack against a pull that grows; `flat` is a
+    // fixed margin for scheduling jitter that does not scale with buffer size.
+    // Measured here: a WF-1000XM5 pulls 480 frames (10 ms), so the defaults of
+    // 50% and 10 ms put the cushion at 25 ms.
+    //
+    // Both are exposed for the same reason as the floor: the right values
+    // depend on the radio environment and the headset, and the way to find
+    // them is to lower them and watch `underruns`.
+    int  cushionHeadroomPercent = 50;
+    int  cushionFlatMs = 10;
     bool autostart = false;
     int  logLevel = 2;
+    // VBAN stream server (spec docs/specs/2026-10-07-vban-stream-server-design.md §6.1)
+    VbanConfig vban;
 };
 
 MixerConfig  ConfigFromJson(const JsonValue& root);   // missing/wrong-typed fields -> defaults

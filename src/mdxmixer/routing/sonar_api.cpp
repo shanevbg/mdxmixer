@@ -1,9 +1,11 @@
 #include "routing/sonar_api.h"
+#include "routing/http_reuse.h"
 #include "config/json_utils.h"
 #include "app/log.h"
 #include <windows.h>
 #include <winhttp.h>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -81,35 +83,81 @@ bool SplitUrl(const std::wstring& url, const std::wstring& path, Url& out) {
     return out.port != 0 && !out.host.empty();
 }
 
-// One request. Returns false for a transport failure or any non-2xx, and sets
-// *connectionFailed when nothing answered at all — the only case worth
-// re-discovering for.
-bool RawRequest(const wchar_t* verb, const Url& u, std::wstring* body,
-                bool* connectionFailed) {
+// ── The kept-open connection ─────────────────────────────────────────────
+//
+// See routing/http_reuse.h for why, and for the rule that replaces what
+// closing everything after every call used to buy. What is held is the session
+// and the connection; the REQUEST is per-call, as it has to be.
+struct ConnPool {
+    HINTERNET session = nullptr;
+    HINTERNET connect = nullptr;
+    std::wstring host;
+    INTERNET_PORT port = 0;
+    bool https = false;
+};
+
+ConnPool g_pool;
+// WinHTTP tolerates handles crossing threads, but not two calls working one
+// handle at once. Sonar writes come from the UI thread and reads can come from
+// elsewhere, so the pooled path is serialised -- an uncontended lock, against
+// the tens of milliseconds it replaces.
+std::mutex g_poolMutex;
+
+void CloseConnPool() {
+    if (g_pool.connect) WinHttpCloseHandle(g_pool.connect);
+    if (g_pool.session) WinHttpCloseHandle(g_pool.session);
+    g_pool.connect = nullptr;
+    g_pool.session = nullptr;
+    g_pool.host.clear();
+    g_pool.port = 0;
+}
+
+// The session and connection for this URL, opened if there is not already one.
+// `fromPool` says whether what came back had been used before, which is what
+// decides whether a failure is worth one retry.
+bool OpenConnPool(const Url& u, bool* fromPool) {
+    if (g_pool.session && g_pool.connect &&
+        PooledConnectionMatches(g_pool.host, (unsigned short)g_pool.port, g_pool.https,
+                                u.host, (unsigned short)u.port, u.https)) {
+        if (fromPool) *fromPool = true;
+        return true;
+    }
+    CloseConnPool();   // different address, or a half-open pair
+    if (fromPool) *fromPool = false;
+
+    g_pool.session = WinHttpOpen(L"mdxmixer/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!g_pool.session) return false;
+    WinHttpSetTimeouts(g_pool.session, SonarHttp::kConnectTimeoutMs, SonarHttp::kConnectTimeoutMs,
+                       SonarHttp::kReceiveTimeoutMs, SonarHttp::kReceiveTimeoutMs);
+    g_pool.connect = WinHttpConnect(g_pool.session, u.host.c_str(), u.port, 0);
+    if (!g_pool.connect) {
+        CloseConnPool();
+        return false;
+    }
+    g_pool.host = u.host;
+    g_pool.port = u.port;
+    g_pool.https = u.https;
+    return true;
+}
+
+// One request on the pooled connection. Returns false for a transport failure
+// or any non-2xx, and sets *connectionFailed when nothing answered at all —
+// the only case worth re-discovering for.
+bool RawRequestOnce(const wchar_t* verb, const Url& u, std::wstring* body,
+                    bool* connectionFailed, bool* usedPool) {
     if (connectionFailed) *connectionFailed = false;
 
-    HINTERNET session = WinHttpOpen(L"mdxmixer/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
-                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) {
+    if (!OpenConnPool(u, usedPool)) {
         if (connectionFailed) *connectionFailed = true;
         return false;
     }
-    WinHttpSetTimeouts(session, SonarHttp::kConnectTimeoutMs, SonarHttp::kConnectTimeoutMs,
-                       SonarHttp::kReceiveTimeoutMs, SonarHttp::kReceiveTimeoutMs);
-
-    HINTERNET connect = WinHttpConnect(session, u.host.c_str(), u.port, 0);
-    if (!connect) {
-        WinHttpCloseHandle(session);
-        if (connectionFailed) *connectionFailed = true;
-        return false;
-    }
+    HINTERNET connect = g_pool.connect;
 
     HINTERNET request = WinHttpOpenRequest(connect, verb, u.path.c_str(), nullptr,
                                            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                            u.https ? WINHTTP_FLAG_SECURE : 0);
     if (!request) {
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
         if (connectionFailed) *connectionFailed = true;
         return false;
     }
@@ -148,13 +196,36 @@ bool RawRequest(const wchar_t* verb, const Url& u, std::wstring* body,
         *connectionFailed = true;
     }
 
-    WinHttpCloseHandle(request);
-    WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
+    WinHttpCloseHandle(request);   // the session and connection stay open
     return ok;
 }
 
+// One request, with the single retry the pool has to earn: a kept connection
+// that has gone stale -- GG restarted, most often -- is thrown away and the
+// call tried once more on a new one. See RetryOnFreshConnection.
+bool RawRequest(const wchar_t* verb, const Url& u, std::wstring* body,
+                bool* connectionFailed) {
+    std::lock_guard<std::mutex> lock(g_poolMutex);
+    for (int attempt = 0; ; ++attempt) {
+        bool failed = false, pooled = false;
+        if (RawRequestOnce(verb, u, body, &failed, &pooled)) {
+            if (connectionFailed) *connectionFailed = false;
+            return true;
+        }
+        if (!RetryOnFreshConnection(failed, pooled, attempt)) {
+            if (connectionFailed) *connectionFailed = failed;
+            return false;
+        }
+        CloseConnPool();
+    }
+}
+
 } // namespace
+
+void SonarHttpCloseConnection() {
+    std::lock_guard<std::mutex> lock(g_poolMutex);
+    CloseConnPool();
+}
 
 // ── Transport ────────────────────────────────────────────────────────────
 
@@ -408,10 +479,14 @@ const wchar_t* SonarEndpointSuffix(const std::wstring& key) {
 
 } // namespace
 
-float SonarChannelPeak(const std::vector<DeviceLevel>& levels,
-                       const std::wstring& key) {
+// The endpoint a Sonar channel's meter is joined onto, or nullptr.
+//
+// Split out so the held and the unheld reading cannot drift apart on HOW the
+// join is made: the two differ only in which field they take off the row.
+static const DeviceLevel* SonarChannelEndpoint(const std::vector<DeviceLevel>& levels,
+                                               const std::wstring& key) {
     const wchar_t* suffix = SonarEndpointSuffix(key);
-    if (!suffix) return kPeakUnknown;
+    if (!suffix) return nullptr;
     // Matched on `name`, which is what WINDOWS calls the device, and never on
     // `displayName`: an alias is the user's to change, and a join that breaks
     // when someone renames "SteelSeries Sonar - Aux" to "Radio" is a join that
@@ -429,8 +504,20 @@ float SonarChannelPeak(const std::vector<DeviceLevel>& levels,
     const std::wstring want = std::wstring(L"SteelSeries Sonar - ") + suffix;
     for (const auto& d : levels)
         if (d.isRender == wantRender && d.name.rfind(want, 0) == 0)
-            return d.peak;
-    return kPeakUnknown;
+            return &d;
+    return nullptr;
+}
+
+float SonarChannelPeak(const std::vector<DeviceLevel>& levels, const std::wstring& key) {
+    const DeviceLevel* d = SonarChannelEndpoint(levels, key);
+    return d ? d->peak : kPeakUnknown;
+}
+
+// The same join through the UNHELD reading, for a meter on screen. See
+// FaderPeakNow and dsp/meter_ballistics.h.
+float SonarChannelPeakNow(const std::vector<DeviceLevel>& levels, const std::wstring& key) {
+    const DeviceLevel* d = SonarChannelEndpoint(levels, key);
+    return d ? d->peakNow : kPeakUnknown;
 }
 
 } // namespace mdxm

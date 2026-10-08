@@ -51,11 +51,39 @@ std::wstring AssignedChannel(const MixerConfig& cfg, const std::wstring& exePath
     return L"";
 }
 
+// The Route column: assigned-channel against what Windows actually holds for
+// the process (fj#1 item 4).
+//
+// Windows persists a per-app route ITSELF, which is what hid the missing
+// reconciler for so long -- an app assigned once while it was playing keeps
+// working across restarts with no help from mdxmixer, so the only symptoms
+// were "that app won't take an assignment" and "that app came back on the
+// wrong device". A column that says which is which turns both into something
+// visible rather than inferred.
+//
+// The comparison is made by the controller, not here: resolving a channel to
+// its routable endpoint is the reconciler's own logic and a second copy of it
+// in the UI is how the two come to disagree.
+std::wstring RouteCell(const AppRouteState& r) {
+    if (r.intendedChannel.empty()) return L"";          // nobody assigned it; not our business
+    if (!r.available) return L"unavailable";            // the API did not resolve on this build
+    if (r.intendedEndpointId.empty()) return L"no cable";   // channel has nowhere to send yet
+    if (r.actualEndpointId.empty()) return L"not applied";  // recorded, waiting for the app to play
+    if (_wcsicmp(r.actualEndpointId.c_str(), r.intendedEndpointId.c_str()) == 0) return L"ok";
+    return L"elsewhere";
+}
+
 void Reload(HWND hwnd, RoutingTabState* st) {
     HWND list = GetDlgItem(hwnd, kList);
     ListView_DeleteAllItems(list);
     st->sessions = EnumerateSessions();
     const MixerConfig& cfg = st->ctx->store->Get();
+    // Every row's route in one call: see IMixerControl::GetAppRoutes, which
+    // needs an endpoint enumeration and must not run one per row.
+    std::vector<std::pair<std::wstring, unsigned long>> apps;
+    apps.reserve(st->sessions.size());
+    for (const auto& s : st->sessions) apps.push_back({ s.exePath, s.pid });
+    const std::vector<AppRouteState> routes = st->ctx->ctl->GetAppRoutes(apps);
     int row = 0;
     for (const auto& s : st->sessions) {
         const wchar_t* exeName = wcsrchr(s.exePath.c_str(), L'\\');
@@ -71,6 +99,9 @@ void Reload(HWND hwnd, RoutingTabState* st) {
         ListView_SetItemText(list, row, 2, const_cast<wchar_t*>(s.endpointName.c_str()));
         std::wstring ch = AssignedChannel(cfg, s.exePath);
         ListView_SetItemText(list, row, 3, const_cast<wchar_t*>(ch.c_str()));
+        std::wstring route = (size_t)row < routes.size() ? RouteCell(routes[(size_t)row])
+                                                         : std::wstring();
+        ListView_SetItemText(list, row, 4, const_cast<wchar_t*>(route.c_str()));
         ++row;
     }
 }
@@ -90,9 +121,13 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                 10, 10, 810, 330, hwnd, (HMENU)(INT_PTR)kList, inst, nullptr);
             ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT);
-            struct { const wchar_t* name; int width; } cols[4] = {
-                { L"Application", 200 }, { L"PID", 70 }, { L"Playing on", 320 }, { L"Channel", 140 } };
-            for (int i = 0; i < 4; ++i) {
+            // "Channel" is what mdxmixer was told; "Route" is what Windows is
+            // actually doing about it. Both, because the two can disagree and
+            // the disagreement is the thing worth seeing (fj#1).
+            struct { const wchar_t* name; int width; } cols[5] = {
+                { L"Application", 190 }, { L"PID", 60 }, { L"Playing on", 280 },
+                { L"Channel", 120 }, { L"Route", 90 } };
+            for (int i = 0; i < 5; ++i) {
                 LVCOLUMNW col = {};
                 col.mask = LVCF_TEXT | LVCF_WIDTH;
                 col.pszText = const_cast<wchar_t*>(cols[i].name);

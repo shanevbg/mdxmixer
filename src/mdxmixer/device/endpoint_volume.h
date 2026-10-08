@@ -79,6 +79,15 @@ struct DeviceLevel {
     // client sorting by what is making sound would rank them as confidently
     // quiet. Same rule this struct already applies to `battery`.
     float peak = kPeakUnknown;
+    // The same reading with NO hold on it: what the meter said at the instant
+    // of the sweep.
+    //
+    // `peak` above is overwritten by the controller with a 1.5 s peak-hold,
+    // which is right for the wire -- a spike has to survive mdxmixer to
+    // MDropDX12 to a phone. It is wrong for a meter somebody is watching, which
+    // should fall promptly and smoothly (dsp/meter_ballistics.h). Both numbers
+    // cost one read, so both are published and each surface picks.
+    float peakNow = kPeakUnknown;
     // How the user filed it: see DeviceView in device_identity.h. Filled in by
     // the controller from the saved list, not read from Windows.
     bool hidden = false;
@@ -90,6 +99,74 @@ struct DeviceLevel {
 // DeviceLevel::active. Never throws; a device that refuses to report is
 // skipped.
 std::vector<DeviceLevel> ListEndpointVolumes();
+
+// The same sweep, told which endpoints need their IDENTITY ONLY — no volume,
+// no meter, so no COM activation and no reads.
+//
+// An endpoint the user has hidden in the mixer has no row to draw, so its
+// level and its peak are collected for nobody. On this machine that is not a
+// rounding error: installing Voicemeeter and VB-Matrix took the endpoint count
+// to 53, about 45 of them ACTIVE, and sixteen of those are VBMatrix In/Out
+// rows that exist only because the driver creates eight of each.
+//
+// Hidden is the APP's idea, not Windows' (DeviceView in device_identity.h), and
+// resolving it needs the name and container this sweep produces — so the caller
+// passes the ids that resolved to hidden LAST time. A newly hidden device is
+// swept in full once more and then goes quiet, which is the right way round:
+// the cost of being one sweep late is a stale reading nobody is looking at.
+std::vector<DeviceLevel> ListEndpointVolumes(const std::vector<std::wstring>& identityOnlyIds);
+
+// ── The per-endpoint COM cache ───────────────────────────────────────────────
+//
+// IAudioEndpointVolume and IAudioMeterInformation are activated once per
+// endpoint and kept. "com activations are very costly" — and this sweep ran
+// four times a second on the UI thread, rebuilding about ninety of them each
+// time, which measured 98-161 ms out of every 250 ms tick.
+//
+// The cached interfaces outlive the IMMDevice they came from: an activated
+// endpoint object holds its own reference to the device and does not depend on
+// the enumerator's wrapper. What they do NOT outlive is the endpoint itself, so:
+//
+//   * InvalidateEndpointCache() drops everything, and is what a device
+//     arrival/removal/state change must call. It takes no COM calls and no
+//     locks of its own beyond the cache's, so it is safe from the debounced
+//     device-change handler — but NOT from inside an IMMNotificationClient
+//     callback, which may only signal (MDropDX12 fj#401).
+//   * a read that fails invalidates its own entry and re-activates once, which
+//     covers an endpoint that died between sweeps without a notification.
+//
+// Single-threaded by design: the cache belongs to the thread that filled it
+// (the UI thread, an STA for the life of the process). A call from any other
+// thread bypasses it entirely rather than hand an apartment-bound pointer
+// across threads, so the CLI paths and the engine are unaffected.
+void InvalidateEndpointCache();
+
+// Release the cached interfaces now. MUST be called while COM is still
+// initialised on the owning thread — releasing after CoUninitialize is a
+// use-after-teardown, which is why this is explicit rather than a static
+// destructor.
+void ReleaseEndpointCache();
+
+// Where a sweep spent its time. Filled in by every ListEndpointVolumes call;
+// `--sweepprof` prints it, and the first sweep of a process is the honest
+// "before" measurement because nothing is cached yet.
+struct SweepProfile {
+    double totalMs = 0;
+    double btInfoMs = 0;         // ReadBluetoothInfo, once per sweep
+    double enumMs = 0;           // enumerator, defaults, EnumAudioEndpoints
+    double nameMs = 0;           // OpenPropertyStore + FriendlyName
+    double activateMs = 0;       // Activate(IAudioEndpointVolume/MeterInformation)
+    double readMs = 0;           // GetMasterVolumeLevelScalar/GetMute/GetPeakValue
+    double containerMs = 0;      // EndpointContainerId   (registry)
+    double lastSeenMs = 0;       // EndpointLastSeenUtc   (registry)
+    int endpoints = 0;
+    int active = 0;
+    int identityOnly = 0;        // skipped because the user hid them
+    int cacheHits = 0;           // endpoints whose interfaces were reused
+    int cacheMisses = 0;         // endpoints that had to be activated
+    int cacheDropped = 0;        // entries thrown out after a failed read
+};
+SweepProfile LastSweepProfile();
 
 bool SetEndpointVolume(const std::wstring& endpointId, float vol01);
 bool SetEndpointMute(const std::wstring& endpointId, bool mute);

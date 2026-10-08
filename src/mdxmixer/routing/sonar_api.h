@@ -38,6 +38,15 @@ namespace mdxm {
 // The port MOVES when GG restarts. A connection-level failure therefore
 // triggers exactly one re-discovery before the caller is told no: a GG that
 // restarted onto a new port and a GG that hung are otherwise identical.
+
+// Drop the HTTP connection mdxmixer keeps open to GG.
+//
+// The connection is held between calls so a mute does not pay for a TCP setup
+// (routing/http_reuse.h). It is dropped when the address it points at stops
+// being the right one -- a re-discovery, or GG going away -- and re-opened by
+// the next call that needs it. Safe to call when there is none.
+void SonarHttpCloseConnection();
+
 class SonarHttp {
 public:
     // Deliberately short. SteelSeries hangs regularly — that is the whole
@@ -55,8 +64,9 @@ public:
     bool Get(const std::wstring& path, std::wstring& body);
     bool Put(const std::wstring& path);
 
-    // Drops the cached address, so the next call re-discovers.
-    void Forget() { m_base.clear(); }
+    // Drops the cached address, so the next call re-discovers. The kept-open
+    // connection goes with it: it points at the address being forgotten.
+    void Forget() { m_base.clear(); SonarHttpCloseConnection(); }
 
     // Test seam: point the client at a chosen address without discovery.
     //
@@ -175,5 +185,11 @@ std::wstring SonarWritePath(const std::wstring& key, bool personal,
 // the Stream endpoint -- so no single number speaks for it.
 float SonarChannelPeak(const std::vector<DeviceLevel>& levels,
                        const std::wstring& key);
+
+// The same join through the UNHELD reading, for a meter drawn on screen: it
+// applies its own fall (dsp/meter_ballistics.h) rather than inheriting the
+// 1.5 s hold the wire needs.
+float SonarChannelPeakNow(const std::vector<DeviceLevel>& levels,
+                          const std::wstring& key);
 
 } // namespace mdxm

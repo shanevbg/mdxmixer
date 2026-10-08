@@ -33,7 +33,7 @@ constexpr int kFoAdd = 1513, kFoRemove = 1514, kFoUp = 1515, kFoDown = 1516;
 constexpr int kFoHint = 1517;
 constexpr int kFoView = 1518, kFoViewLabel = 1519;
 constexpr int kFoName = 1522, kFoSetName = 1523, kFoNameLabel = 1524;
-constexpr int kFoPrune = 1525, kFoNowOn = 1526;
+constexpr int kFoPrune = 1525, kFoNowOn = 1526, kFoDedupe = 1527;
 constexpr int kHeadDevices = 1520, kHeadFailover = 1521;
 constexpr int kChanBase = 1550;   // + channel index: source endpoint combo
 
@@ -72,6 +72,10 @@ struct DevicesTabState {
     // moment a sort view is chosen, and every button has to act on the ENTRY,
     // not on the row number.
     std::vector<size_t> rowOrder;
+    // Entries left OUT of rowOrder because an earlier entry names the same
+    // device. They are hidden, not deleted; this is what the Remove
+    // duplicates button offers to take, and the number on its face.
+    int dupCount = 0;
     UiMetrics m;
     std::vector<EndpointInfo> eps;
     std::vector<int> renderIdx, captureIdx, allIdx;
@@ -251,12 +255,24 @@ struct AllowCells {
 };
 
 AllowCells AllowRow(DevicesTabState* st, const DeviceRef& entry) {
-    // An entry matches by id, or -- for one added while its device was
-    // switched off, which has no id -- by the Windows name it stored.
+    // SameDevice, which is the engine's rule too (device_identity.h).
+    //
+    // This used to match by id and fall back to the name ONLY for an entry
+    // that had never had an id. Every entry whose endpoint had been re-created
+    // -- twenty of Shane's twenty-one -- then read as unknown while the
+    // failover watcher went on matching those same entries by name and using
+    // them: "According to list box has only seen one device ever and that was
+    // yesterday". One row resolved, because one stored id happened to still be
+    // live. A list that disagrees with the engine about what is in it is worse
+    // than no list, and it was driving the Remove unknown count.
+    const std::wstring entryAlias =
+        AliasFor(st->ctx->store->Get().deviceNames, entry.id, L"", entry.name);
+    const DeviceRefKeys ref{ entry.id, entry.name,
+                             AliasOrNone(entryAlias, entry.name), entry.btAddress };
     const DeviceLevel* found = nullptr;
     for (const auto& d : st->levels) {
-        if ((!entry.id.empty() && d.id == entry.id) ||
-            (entry.id.empty() && !entry.name.empty() && d.name == entry.name)) {
+        if (SameDevice(ref, { d.id, d.name,
+                              AliasOrNone(d.displayName, d.name), d.btAddress })) {
             found = &d;
             break;
         }
@@ -483,6 +499,41 @@ void ReloadFailoverList(HWND hwnd, DevicesTabState* st) {
         });
     }
 
+    // Duplicates collapse HERE, in the view, and nothing is deleted.
+    //
+    // Seven headsets had become twenty-one entries, because each re-pairing
+    // was added beside the one it replaced. The obvious answer is a prune
+    // button, and there is one below -- but "I never touched the remove
+    // unknown button as I have enough of a time keeping things solid as
+    // development changes happen", which is the right instinct and makes a
+    // view that only reads correctly after a deletion the wrong design. The
+    // list shows each device once; the stored list is left alone until he
+    // says otherwise.
+    //
+    // Decided in STORED order, never the view's: the first entry for a device
+    // is the one kept, and that has to mean first by preference rather than
+    // first by whatever column is sorted today.
+    {
+        std::vector<DeviceRefKeys> refs;
+        refs.reserve(allow.size());
+        for (const auto& e : allow)
+            refs.push_back({ e.id, e.name,
+                             AliasOrNone(AliasFor(st->ctx->store->Get().deviceNames,
+                                                  e.id, L"", e.name), e.name),
+                             e.btAddress });
+        const std::vector<size_t> dupes = DuplicateRefs(refs);
+        st->dupCount = (int)dupes.size();
+        if (!dupes.empty()) {
+            std::vector<size_t> kept;
+            for (size_t i : st->rowOrder) {
+                bool drop = false;
+                for (size_t d : dupes) if (d == i) { drop = true; break; }
+                if (!drop) kept.push_back(i);
+            }
+            st->rowOrder.swap(kept);
+        }
+    }
+
     // The arrow on the header, so the direction is visible rather than
     // remembered. Cleared from every other column, or two would claim it.
     if (HWND hdr = ListView_GetHeader(list)) {
@@ -547,8 +598,12 @@ void ReloadFailoverList(HWND hwnd, DevicesTabState* st) {
     // How many rows have no device behind them at all. Those are the ones
     // "Remove unknown" takes, and the number is what makes it answerable
     // before pressing it.
+    //
+    // Counted over the VISIBLE rows, not every entry: a hidden duplicate is
+    // already spoken for by the row that replaced it, and counting it here
+    // would offer to remove the same row twice under two different names.
     int unknown = 0;
-    for (const AllowCells& c : cells) if (c.unknown) ++unknown;
+    for (size_t i : st->rowOrder) if (cells[i].unknown) ++unknown;
     if (HWND b = GetDlgItem(hwnd, kFoPrune)) {
         wchar_t label[48];
         swprintf(label, 48, L"Remove unknown (%d)", unknown);
@@ -556,6 +611,16 @@ void ReloadFailoverList(HWND hwnd, DevicesTabState* st) {
         GetWindowTextW(b, had, 48);
         if (wcscmp(had, label) != 0) SetWindowTextW(b, label);
         EnableWindow(b, unknown > 0);
+    }
+    // The duplicates are already out of the list above. This only offers to
+    // make that permanent in the stored file.
+    if (HWND b = GetDlgItem(hwnd, kFoDedupe)) {
+        wchar_t label[48];
+        swprintf(label, 48, L"Remove duplicates (%d)", st->dupCount);
+        wchar_t had[48] = {};
+        GetWindowTextW(b, had, 48);
+        if (wcscmp(had, label) != 0) SetWindowTextW(b, label);
+        EnableWindow(b, st->dupCount > 0);
     }
 
     // Move Up and Down edit the RULE, so they are meaningless through a sort.
@@ -645,9 +710,28 @@ void Build(HWND hwnd, DevicesTabState* st, HINSTANCE inst) {
     row(L"Mic input", kMicIn);
     row(L"Mic cable", kMicCable);
 
+    // "Audio source", not "<channel name> source".
+    //
+    // The label used to be assembled from the channel's own name, so the one
+    // channel on this machine -- called "Sonar" -- produced a row reading
+    // "Sonar source", which reads as a control belonging to SteelSeries rather
+    // than as the source of a channel that happens to be named after it: "I
+    // don't think Sonar source is a good term, Audio Source or Source would
+    // make more sense as will use same type of source for voicemeeter or even
+    // without sonar".
+    //
+    // It is the capture endpoint this channel's audio ARRIVES on, which is the
+    // same thing whether a Sonar virtual device, a Voicemeeter cable, a plain
+    // VB-CABLE with nothing upstream, or a hardware input is feeding it.
+    //
+    // The channel name comes back only when there is more than one channel to
+    // tell apart, because then the row genuinely is about a particular one and
+    // three rows reading "Audio source" would say nothing.
     const MixerConfig& cfg = st->ctx->store->Get();
+    const bool several = cfg.channels.size() > 1;
     for (const auto& c : cfg.channels) {
-        std::wstring text = (c.name.empty() ? c.id : c.name) + L" source";
+        std::wstring text = L"Audio source";
+        if (several) text += L" (" + (c.name.empty() ? c.id : c.name) + L")";
         row(text.c_str(), kChanBase + (int)st->chIds.size());
         st->chIds.push_back(c.id);
     }
@@ -782,6 +866,14 @@ void Build(HWND hwnd, DevicesTabState* st, HINSTANCE inst) {
     CreateWindowExW(0, L"BUTTON", L"Remove unknown", WS_CHILD | WS_VISIBLE,
                     rx, ry, m.BtnW() * 2, m.BtnH(),
                     hwnd, (HMENU)(INT_PTR)kFoPrune, inst, nullptr);
+    // And the other way a list of seven headsets reaches twenty-one entries:
+    // the same headset added again under a new pairing, beside the entry it
+    // replaced. Separate from "Remove unknown" because it is a different
+    // claim -- those rows all HAVE a device, it is just the same device twice
+    // -- and because a user may well want one and not the other.
+    CreateWindowExW(0, L"BUTTON", L"Remove duplicates", WS_CHILD | WS_VISIBLE,
+                    rx + m.BtnW() * 2 + m.S(6), ry, m.BtnW() * 2, m.BtnH(),
+                    hwnd, (HMENU)(INT_PTR)kFoDedupe, inst, nullptr);
     ry += m.BtnH() + m.S(12);
     // Renaming lives HERE as well as on the Mixer tab, because this is the
     // list where the names are read and so the list where a wrong one is
@@ -933,9 +1025,23 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 st->ctx->store->Mutate([&](MixerConfig& c) {
                     auto& allow = c.personalFailover.allow;
                     if (sel >= (int)allow.size()) return;
-                    if (id == kFoRemove) allow.erase(allow.begin() + sel);
-                    else if (id == kFoUp && sel > 0) std::swap(allow[(size_t)sel], allow[(size_t)sel - 1]);
-                    else if (id == kFoDown && sel + 1 < (int)allow.size()) std::swap(allow[(size_t)sel], allow[(size_t)sel + 1]);
+                    if (id == kFoRemove) { allow.erase(allow.begin() + sel); return; }
+                    // Swap with the neighbouring VISIBLE row's entry, not with
+                    // the adjacent index.
+                    //
+                    // A collapsed duplicate can sit between two visible rows,
+                    // and swapping across it would move the selection past a
+                    // row nobody can see -- the list would sit still while the
+                    // stored order changed, which is the exact complaint the
+                    // sorted views are already careful about.
+                    int pos = -1;
+                    for (size_t n = 0; n < st->rowOrder.size(); ++n)
+                        if ((int)st->rowOrder[n] == sel) { pos = (int)n; break; }
+                    if (pos < 0) return;
+                    const int other = pos + (id == kFoUp ? -1 : 1);
+                    if (other < 0 || other >= (int)st->rowOrder.size()) return;
+                    const size_t with = st->rowOrder[(size_t)other];
+                    if (with < allow.size()) std::swap(allow[(size_t)sel], allow[with]);
                 });
                 ReloadFailoverList(hwnd, st);
                 // Up and Down are only enabled in the stored order, where row
@@ -971,6 +1077,44 @@ LRESULT CALLBACK Proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         if (dead[n] < c.personalFailover.allow.size())
                             c.personalFailover.allow.erase(
                                 c.personalFailover.allow.begin() + (ptrdiff_t)dead[n]);
+                });
+                RefreshFailover(hwnd, st);
+                return 0;
+            }
+            if (id == kFoDedupe) {
+                // The list is ALREADY showing one row per device; this only
+                // makes that true of the stored file. Which is why it asks:
+                // nothing visible changes, so the only thing to confirm is
+                // the deletion itself.
+                const auto& allow = st->ctx->store->Get().personalFailover.allow;
+                std::vector<DeviceRefKeys> refs;
+                refs.reserve(allow.size());
+                for (const auto& e : allow)
+                    refs.push_back({ e.id, e.name,
+                                     AliasOrNone(AliasFor(st->ctx->store->Get().deviceNames,
+                                                          e.id, L"", e.name), e.name),
+                                     e.btAddress });
+                const std::vector<size_t> dupes = DuplicateRefs(refs);
+                if (dupes.empty()) {
+                    SetWindowTextW(GetDlgItem(hwnd, kStatus),
+                                   L"Every entry names a different device.");
+                    return 0;
+                }
+                wchar_t ask[400];
+                swprintf(ask, 400,
+                         L"Remove %zu entr%s that name a device another entry "
+                         L"already names?\n\n"
+                         L"The list is already showing one row per device, so nothing "
+                         L"on screen changes. The first entry for each device is kept, "
+                         L"because the order of this list is the failover preference.",
+                         dupes.size(), dupes.size() == 1 ? L"y" : L"ies");
+                if (MessageBoxW(hwnd, ask, L"mdxmixer", MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+                    return 0;
+                st->ctx->store->Mutate([&](MixerConfig& c) {
+                    for (size_t n = dupes.size(); n-- > 0; )
+                        if (dupes[n] < c.personalFailover.allow.size())
+                            c.personalFailover.allow.erase(
+                                c.personalFailover.allow.begin() + (ptrdiff_t)dupes[n]);
                 });
                 RefreshFailover(hwnd, st);
                 return 0;

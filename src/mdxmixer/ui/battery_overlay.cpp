@@ -1,4 +1,5 @@
 #include "ui/battery_overlay.h"
+#include "ui/topmost.h"   // BoostedOpacityUnderWatermark
 #include "device/device_identity.h"
 #include <windowsx.h>
 #include <algorithm>
@@ -273,7 +274,12 @@ void BatteryOverlay::ApplyStyles() {
     const bool framed    = m_cfg.frame || m_moving;
     const bool clickThru = m_cfg.clickThrough && !framed;
     const bool panel     = m_cfg.background || framed;
-    const int  opacity   = framed ? 100 : m_cfg.opacity;
+    // Framed means "grab me", so it goes fully opaque whatever else is set.
+    // Otherwise the stored opacity, lifted while MDropDX12's watermark is
+    // over us -- see SetUnderWatermark and BoostedOpacityUnderWatermark.
+    const int  opacity   = framed ? 100
+                         : m_underWatermark ? BoostedOpacityUnderWatermark(m_cfg.opacity)
+                                            : m_cfg.opacity;
 
     // Opacity below 100, or a colour key, or click-through: any of the three
     // needs the layered bit.
@@ -457,6 +463,15 @@ RECT BatteryOverlay::Bounds() const {
     RECT rc = {};
     if (m_hwnd) GetWindowRect(m_hwnd, &rc);
     return rc;
+}
+
+void BatteryOverlay::SetUnderWatermark(bool under) {
+    // Only on a CHANGE. This is asked once a second for the life of the
+    // program, and re-applying the layered attributes every time would repaint
+    // the overlay over whatever is beneath it for no reason at all.
+    if (m_underWatermark == under) return;
+    m_underWatermark = under;
+    if (m_hwnd) ApplyStyles();
 }
 
 void BatteryOverlay::BeginInteractiveMove() {

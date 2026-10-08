@@ -62,6 +62,27 @@ public:
     uint64_t Underruns() const { return m_underruns.load(std::memory_order_relaxed); }
     void Clear() { m_read.store(m_write.load(std::memory_order_acquire), std::memory_order_release); }
 
+    // Resize, which is also the only way the capacity is chosen at all now that
+    // it is derived from the mix rate (fj#13).
+    //
+    // CAPACITY IS THE WORST-CASE LATENCY. When the consumer stalls, the
+    // producer fills this and the backlog that is left behind is however much
+    // fits -- so a ring sized for the rare burst is also a ring that can hand
+    // back that much permanent latency. Measured on this machine: pulls of 480
+    // frames, largest ever 960, against a ring that used to hold 96000.
+    //
+    // CONTROL THREAD ONLY, and only while nothing is reading or writing: it
+    // reallocates. Every caller does it with the capture stopped or the graph
+    // marked not ready.
+    void Resize(size_t capacityFrames) {
+        if (capacityFrames == 0) capacityFrames = 1;
+        m_capacity = capacityFrames;
+        m_data.assign(capacityFrames * 2, 0.0f);
+        m_read.store(0, std::memory_order_relaxed);
+        m_write.store(0, std::memory_order_release);
+    }
+    size_t Capacity() const { return m_capacity; }
+
 private:
     size_t m_capacity;
     std::vector<float> m_data;

@@ -1,5 +1,138 @@
 # Changes
 
+## v1.2.0 (unreleased)
+
+### mdxmixer speaks VBAN
+
+The monitor mix can leave this machine over the network, to be listened to on a
+phone — and the phone can drive the mixer back over the same association. The
+protocol is **VBAN** (VB-Audio's, rev 13), implemented compliantly rather than
+approximated, so any standard VBAN tool on the network can discover this
+machine and play its stream: no second protocol to invent, and the first-party
+apps are the interoperability test.
+
+Design: `docs/specs/2026-10-07-vban-stream-server-design.md`. This reverses a
+v1 non-goal — "no network audio" was an estimate of the work, not a judgement
+that it did not belong.
+
+- **The wire layer.** The 28-byte header, the sample-rate table (three
+  geometric families, so 48 kHz is index 3 and computing the index instead of
+  looking it up puts the stream on the wrong rate), and packet validation.
+  Pure and headless-tested down to the byte offsets of every field: this is the
+  one part of the feature whose mistakes are invisible from this end of the
+  network and silent at the other.
+
+- **Audio out, on demand.** The listener is up whenever you have switched it on
+  — and that setting persists, because the point is that a phone can subscribe
+  without anyone touching the PC. Nothing is actually sent until a client asks,
+  by pinging, and it stops when the last one stops asking. A client that goes
+  quiet for ten seconds has stopped asking.
+
+- **The personal mix, amplified before the wire.** What goes out is the monitor
+  mix by default — your per-channel balance and personal mutes, not the
+  programme mix. It is amplified PC-side (up to 6400 %) because the personal sum
+  on this machine runs at a few percent of full scale: the faders *are* the
+  listening level, so sending it unamplified would put a 20–40 dB-down signal
+  into a phone.
+
+- **It is the real protocol, so VB-Audio's own apps play it.** VBAN Receptor
+  Lite on a phone, or Voicemeeter, will find and play the stream with nothing of
+  ours installed. That is the point of implementing the specification rather than
+  approximating it: the interoperability test is somebody else's software.
+
+- **Two new diagnostics.** `mdxmixer --vban` asks the running instance what the
+  stream is doing; `mdxmixer --vbanrx <ip>` subscribes to one and reports what
+  arrives, so "the phone hears nothing" can be split into "nothing is being
+  sent" and "something is wrong at the phone" without a phone in the room.
+
+- **The mixer, over the same association.** An authorised phone can drive
+  mdxmixer through VBAN's own text sub-protocol — the same record grammar the
+  named pipe speaks, so a client needs no second dialect — which means the
+  stream and the controls need the visualiser running for neither. Getting in
+  works the way MDropDX12's remote does: a PIN, then a one-time approval prompt
+  on the PC, after which that device reconnects without asking. Three wrong PINs
+  lock the address out for a minute, and a refusal is remembered.
+
+- **Pictures of the displays.** Each screen goes out as `VIDEO<n>` using VBAN's
+  `FRAME` sub-protocol, which is what VB-Audio's VBAN-Screen reads — so the
+  phone is not the only thing that can watch them. The downscale happens on the
+  GPU before the read-back: a 4K screen costs a dozen kilobytes rather than the
+  thirty megabytes a full-resolution copy would, and nothing is captured at all
+  while nobody is watching. Desktop Duplication, not PrintWindow, because the
+  thing most worth seeing on these screens is another process's DX12 output.
+
+- **A VBAN tab**, with the settings, the live counters and the list of devices
+  that have been let in. The three latency numbers are labelled rather than
+  printed, because the one everybody reads first — how far ahead the producer is
+  — is the one that usually means nothing is wrong.
+
+- **One bug caught before it shipped.** A datagram larger than any legal VBAN
+  packet made the receive loop treat a per-datagram error as fatal, so one
+  oversized packet from anywhere on the network would have stopped mdxmixer
+  answering pings for good. The same path had a worse everyday case: Windows
+  reports a bounced send as an error on the next *receive*, so the listener
+  would have died the first time a phone walked out of range.
+
+- **The installer authorises the exe for inbound UDP**, program-scoped rather
+  than port-scoped so that changing the port cannot strand the rule. A portable
+  copy needs one `netsh` line, which the README gives: without it the symptom is
+  a phone that never connects and nothing anywhere saying why.
+
+## v1.1.0 (unreleased)
+
+Everything here is about the seam between mdxmixer and the programs that drive
+it — MDropDX12 above all, which now takes its mixer channels from here rather
+than driving Sonar itself.
+
+### A front-end can delegate its device list
+
+- **Device rows reach subscribers.** `MDXM_DEVSET` says which rows exist, in
+  mdxmixer's own sort order, and a changed row arrives as the same
+  `MDXM_DEVLVL` a poll would have given. Before this a subscriber learned
+  about channels and never about devices, so a delegated device list had to
+  keep polling the whole state block. Nothing is sent when nothing changed,
+  and nothing at all while nobody is listening.
+- **`hidden` and `pinned` can be set**, by `MDXM_HIDE` and `MDXM_PIN`, and the
+  state is shared both ways: filing a device away over the pipe files it away
+  in mdxmixer's own window, and doing it in that window reaches every
+  subscriber. The two flags are now mutually exclusive, both ways round.
+- **The failover watcher says what it is doing.** `MDXM_FOSTATE` carries its
+  state, the device it believes the route is on, the device it last committed
+  to, how many attempts have not stuck, the dwell actually in force and the
+  reason — so a remote Failover tab can show what happened instead of
+  inferring it.
+
+### Routing and failover
+
+- **A stored app assignment is applied when the app next plays.** mdxmixer now
+  listens for new audio sessions instead of waiting for a device change, so an
+  app launched while it sits in the tray lands on the channel it was assigned
+  to.
+- **The Routing tab shows drift**: what each app is assigned to, against what
+  Windows is actually doing with it.
+- **The failover hold is driven by AUDIODG.EXE itself.** When the Windows
+  audio engine restarts, every endpoint reads absent at once; the watcher now
+  recognises the cause rather than the symptom, stands down for the rebuild,
+  and resumes as soon as the engine has been back and steady for a moment.
+
+### The window
+
+- **Channel rows have peak meters**, one per fader, each showing what *that*
+  fader is passing rather than the channel's source — so a Personal fader at
+  zero shows an empty bar while the Streaming fader beside it shows the signal
+  going out.
+
+### Fixed
+
+- `build.ps1 -Install` installed nothing: the whole block was unreachable, so
+  the flag was accepted, copied nothing and still reported success.
+
+### For anyone writing against the pipe
+
+`docs/ipc.md` gains `MDXM_TAB` and `MDXM_CAPTURE`, which were accepted and
+undocumented, and a test now fails the build if an accepted verb is missing
+from that document.
+
 ## v1.0.0 (2026-10-04)
 
 First release.

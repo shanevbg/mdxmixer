@@ -24,6 +24,7 @@ constexpr int kEnable = 300, kText = 301, kOpacity = 302, kOpacitySpin = 303;
 constexpr int kFontSize = 304, kFontSpin = 305, kClickThru = 306, kBackground = 307;
 constexpr int kPosX = 308, kPosY = 310;
 constexpr int kSpinBoxes = 320, kTaskbar = 321, kAutostart = 322, kVirtual = 325;
+constexpr int kMdx12Adaptive = 326;
 constexpr int kStep = 323, kStepSpin = 324;
 constexpr int kMoveNow = 330, kDisplay = 331, kSnapTL = 332, kSnapTR = 333;
 constexpr int kHotkeys = 337;
@@ -88,6 +89,7 @@ void Save(HWND hwnd, OptionsTabState* st) {
         auto& b = c.batteryOverlay;
         b.enabled      = Checked(hwnd, kEnable);
         b.clickThrough = Checked(hwnd, kClickThru);
+        b.mdx12Adaptive = Checked(hwnd, kMdx12Adaptive);
         b.background   = Checked(hwnd, kBackground);
         b.frame        = Checked(hwnd, kFrame);
         b.opacity      = ReadInt(hwnd, kOpacity, 10, 100, b.opacity);
@@ -124,6 +126,7 @@ void Load(HWND hwnd, OptionsTabState* st) {
     st->loading = true;
     SetChecked(hwnd, kEnable, c.batteryOverlay.enabled);
     SetChecked(hwnd, kClickThru, c.batteryOverlay.clickThrough);
+    SetChecked(hwnd, kMdx12Adaptive, c.batteryOverlay.mdx12Adaptive);
     SetChecked(hwnd, kBackground, c.batteryOverlay.background);
     SetChecked(hwnd, kFrame, c.batteryOverlay.frame);
     SetDlgItemTextW(hwnd, kText, c.batteryOverlay.text.c_str());
@@ -238,6 +241,7 @@ void Layout(HWND hwnd, OptionsTabState* st) {
     check(kFrame);
     check(kClickThru);
     check(kBackground);
+    check(kMdx12Adaptive);
 
     y += m.SectionGap();
     heading(406);
@@ -500,6 +504,18 @@ HWND CreateOptionsTab(HWND parent, UiContext* ctx) {
                 kClickThru, 0, 0, 10, 10, f, true);
     CreateCheck(hwnd, L"Draw a background behind the text",
                 kBackground, 0, 0, 10, 10, f, false);
+    // Two behaviours, one switch, because they are one idea: while
+    // MDropDX12 is watermarking, the overlay sits BELOW its window instead
+    // of fighting it for the front of the topmost band, and lifts its own
+    // opacity to stay readable through it. See ui/topmost.h.
+    //
+    // On by default. Off makes the overlay compete like any other topmost
+    // window, which is the right answer for someone who wants the battery
+    // readout above everything, watermark included.
+    // Kept to the width the column actually has: the first wording ran to 65
+    // characters and was clipped mid-word at "brighten".
+    CreateCheck(hwnd, L"MDx12 adaptive overlay (follow it, brighten to suit)",
+                kMdx12Adaptive, 0, 0, 10, 10, f, true);
 
     label(L"General", 406);
     CreateCheck(hwnd, L"Fader control: step buttons instead of sliders",

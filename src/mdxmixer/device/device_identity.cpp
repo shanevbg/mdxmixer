@@ -240,6 +240,74 @@ uint64_t LocalFileTimeToUtc(uint64_t localFileTime) {
     return ((uint64_t)utc.dwHighDateTime << 32) | utc.dwLowDateTime;
 }
 
+bool SameDevice(const DeviceRefKeys& ref, const DeviceRefKeys& dev) {
+    // ── what RULES IT OUT, before anything that rules it in ──────────────
+    //
+    // A strong anchor that disagrees is decisive, and must not be overridden
+    // by a weak one that happens to agree. Windows REUSES a name: "Headphones
+    // (11- WF-1000XM5)" belongs to whichever of the five identical pairs was
+    // paired eleventh, and the twelfth pairing of a different pair inherits it
+    // later. Two headsets with different addresses wearing the same name is
+    // therefore an ordinary occurrence here, and calling them one device would
+    // point failover at the wrong earbuds.
+    //
+    // Only the two anchors that belong to the DEVICE can rule out. The id and
+    // the Windows name are per-pairing and disagree constantly between two
+    // references to the same headset -- that is the whole reason this function
+    // exists -- so neither can ever be a disqualifier.
+    if (!ref.btAddress.empty() && !dev.btAddress.empty() && ref.btAddress != dev.btAddress)
+        return false;
+    if (!ref.alias.empty() && !dev.alias.empty() && ref.alias != dev.alias)
+        return false;
+
+    // ── and then what rules it IN ────────────────────────────────────────
+    //
+    // The headset's own address first. It outlives the pairing, the endpoint
+    // id, the ContainerId and the Windows name, so it is the only one of these
+    // that is still true after the adapter is swapped.
+    if (!ref.btAddress.empty() && ref.btAddress == dev.btAddress) return true;
+    // Then our own name: already re-homed onto whatever endpoint the device is
+    // wearing today.
+    if (!ref.alias.empty() && ref.alias == dev.alias) return true;
+    if (!ref.id.empty() && ref.id == dev.id) return true;
+    // Windows names are compared exactly, not case-insensitively: they come
+    // from the same source on both sides, and a loose compare here would file
+    // two genuinely different endpoints together.
+    if (!ref.name.empty() && ref.name == dev.name) return true;
+    return false;
+}
+
+bool HealDeviceRef(DeviceRefKeys& ref, const DeviceRefKeys& dev) {
+    bool changed = false;
+    // The address only ever arrives; it is never overwritten, because a device
+    // that answers to an address IS that device and a second opinion would
+    // have to be wrong.
+    if (ref.btAddress.empty() && !dev.btAddress.empty()) {
+        ref.btAddress = dev.btAddress;
+        changed = true;
+    }
+    // The id and the Windows name are the perishable ones, so they are brought
+    // up to date whenever they differ. Not cleared when the device has none:
+    // keeping the last known value is strictly better than nothing for an
+    // entry that may next be matched while its headset is switched off.
+    if (!dev.id.empty() && ref.id != dev.id) { ref.id = dev.id; changed = true; }
+    if (!dev.name.empty() && ref.name != dev.name) { ref.name = dev.name; changed = true; }
+    return changed;
+}
+
+std::vector<size_t> DuplicateRefs(const std::vector<DeviceRefKeys>& refs) {
+    std::vector<size_t> drop;
+    std::vector<size_t> kept;
+    for (size_t i = 0; i < refs.size(); ++i) {
+        bool dup = false;
+        for (size_t k : kept)
+            if (SameDevice(refs[k], refs[i]) || SameDevice(refs[i], refs[k])) { dup = true; break; }
+        if (dup) drop.push_back(i);
+        else kept.push_back(i);
+    }
+    return drop;
+}
+
 std::wstring FormatLastSeen(uint64_t utcFileTime, bool present) {
     if (present) return L"Connected";   // outranks any stamp; see the header
     if (utcFileTime == 0) return {};

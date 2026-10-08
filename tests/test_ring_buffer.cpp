@@ -51,3 +51,38 @@ MDXM_TEST_CASE(Ring_WriteLargerThanCapacityKeepsNewest) {
     CHECK(out[0] == 12.0f);                // frames 6..9 survive
     CHECK(out[7] == 19.0f);
 }
+
+// Capacity is now derived from the mix rate rather than fixed, because it IS
+// the worst-case latency a stall can leave behind (fj#13): the producer fills
+// it while the consumer is away, and whatever fits is what the listener is
+// left holding.
+MDXM_TEST_CASE(Ring_ResizeSetsCapacityAndEmptiesIt) {
+    mdxm::RingBuffer rb(4);
+    float in[8] = { 1, 1, 2, 2, 3, 3, 4, 4 };
+    rb.Write(in, 4);
+    CHECK(rb.Depth() == 4);
+    CHECK(rb.Capacity() == 4);
+
+    rb.Resize(24000);                      // 500 ms at 48 kHz
+    CHECK(rb.Capacity() == 24000);
+    // Emptied: the audio in it belonged to a graph that is being rebuilt, and
+    // keeping it would mean playing the old device's backlog on the new one.
+    CHECK(rb.Depth() == 0);
+
+    // And it works afterwards.
+    rb.Write(in, 4);
+    CHECK(rb.Depth() == 4);
+    float out[8] = {};
+    CHECK(rb.Read(out, 4) == 4);
+    CHECK(out[0] == 1.0f);
+    CHECK(out[6] == 4.0f);
+}
+
+MDXM_TEST_CASE(Ring_ResizeNeverLeavesAZeroCapacity) {
+    mdxm::RingBuffer rb(16);
+    rb.Resize(0);                          // a rate of 0 would compute this
+    CHECK(rb.Capacity() >= 1);
+    float in[2] = { 7, 7 };
+    rb.Write(in, 1);                       // must not divide by zero or crash
+    CHECK(rb.Depth() <= rb.Capacity());
+}

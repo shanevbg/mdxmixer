@@ -3,9 +3,18 @@
 #include "engine/render_stream.h"
 #include "engine/engine.h"
 #include "dsp/ring_buffer.h"
+#include "net/vban_server.h"
+#include "net/vban_protocol.h"
+#include "net/display_capture.h"
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <objbase.h>     // CoInitializeEx, for the capture test's apartment
 #include <cmath>
+#include <cstring>
 #include <vector>
+
+#pragma comment(lib, "ws2_32.lib")
 
 using namespace mdxm;
 
@@ -322,6 +331,193 @@ MDXM_TEST_CASE(Audio_EngineRestartStress) {
         eng.Stop();
     }
     std::printf("15 engine start/stop rounds survived\n");
+}
+
+MDXM_TEST_CASE(Audio_VbanCarriesThePersonalMixAmplified) {
+    // The feature's central claim, end to end on real devices: the PERSONAL mix
+    // -- which on this machine runs at a few percent of full scale, because the
+    // faders are the listening level -- leaves the machine as a VBAN stream at a
+    // usable level, because the makeup gain is applied PC-side before the wire.
+    //
+    // So the channel is set to a realistic monitor level (5 %) and the stream
+    // gain to 400 %, and what is measured is the 440 Hz bin in the int16 samples
+    // that actually came off a socket. The tone IS briefly audible on the
+    // personal output at 0.025 amplitude: this test only runs under --audio, on
+    // the rig, at the operator's request.
+    // MDXM_TEST_PERSONAL must be a REAL output that actually clocks, and MUST
+    // differ from the captured cable. MixPull runs on the personal render's
+    // callback, so a personal output that does not clock (a virtual device with
+    // nothing pulling it, e.g. a Matrix/Voicemeeter input with the app closed)
+    // never drives the mix and the VBAN ring starves; and pointing it at the
+    // captured cable makes the engine refuse it as a feedback loop. Proven on
+    // the rig with RENDER=CAPTURE=<VB-CABLE> (loopback, silent) and
+    // PERSONAL=<headphones>: 440 Hz bin 0.1000, starved 0. A VB-CABLE clocks on
+    // its own, which is why it works as the tone's render target but not,
+    // feedback aside, as the personal clock.
+    std::wstring renderId = EnvW(L"MDXM_TEST_RENDER"), captureId = EnvW(L"MDXM_TEST_CAPTURE");
+    if (renderId.empty() || captureId.empty()) { std::printf("skip (no cable env)\n"); return; }
+    std::wstring personalId = EnvW(L"MDXM_TEST_PERSONAL");
+    if (personalId.empty()) personalId = DefaultRenderEndpointId();
+
+    constexpr int kPort = 46981;          // not 6980: a running mdxmixer keeps its own
+    constexpr float kChannelLevel = 0.05f;
+    constexpr int kGainPercent = 400;
+
+    MixerConfig cfg;
+    ChannelConfig ch;
+    ch.id = L"game"; ch.name = L"Game";
+    ch.cable.capture = { captureId, L"" };
+    ch.personal  = { kChannelLevel, false };   // a realistic monitor level
+    ch.streaming = { 1.0f, false };
+    cfg.channels.push_back(ch);
+    cfg.personalOutput = { personalId, L"" };
+
+    Engine eng;
+    std::wstring err;
+    CHECK(eng.Start(cfg, &err));
+    if (!err.empty()) wprintf(L"engine notes: %s\n", err.c_str());
+
+    VbanConfig vcfg;
+    vcfg.enabled = true;
+    vcfg.port = kPort;
+    vcfg.openSubscribe = true;                 // no auth in this phase
+    vcfg.gainPercent = kGainPercent;
+    // sourceStreaming stays false: the personal sum is the point.
+    VbanServer srv;
+    CHECK(srv.Start(vcfg, &eng.VbanRing(), eng.MixRate(), {}, &err));
+    eng.SetVbanSink(true, false);
+
+    WSADATA w; WSAStartup(MAKEWORD(2, 2), &w);
+    SOCKET c = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in local = {};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind(c, (sockaddr*)&local, (int)sizeof local);
+    DWORD tmo = 2000;
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (char*)&tmo, (int)sizeof tmo);
+
+    // A 440 Hz tone into the channel's cable.
+    RenderStream tone;
+    double phase = 0.0;
+    CHECK(tone.Start(renderId, [&](float* out, size_t frames) {
+        for (size_t i = 0; i < frames; ++i) {
+            float s = 0.5f * (float)std::sin(phase);
+            phase += 2.0 * 3.14159265358979 * 440.0 / (double)tone.DeviceRate();
+            out[i*2] = s; out[i*2+1] = s;
+        }
+    }, &err));
+    Sleep(2500);                               // let the graph and the cushion settle
+
+    // Subscribe, then collect a second of audio.
+    {
+        mdxm::vban::Header h = {};
+        h.vban = mdxm::vban::kMagic;
+        h.format_SR = mdxm::vban::kProtoService;
+        h.format_nbs = mdxm::vban::kServiceFnPing0;
+        h.format_nbc = mdxm::vban::kServiceIdentification;
+        mdxm::vban::FillStreamName(h.streamname, "VBAN Service");
+        sockaddr_in to = {};
+        to.sin_family = AF_INET;
+        to.sin_port = htons((unsigned short)kPort);
+        to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sendto(c, (const char*)&h, (int)sizeof h, 0, (sockaddr*)&to, (int)sizeof to);
+    }
+
+    std::vector<float> got;
+    got.reserve(48000 * 2 * 2);
+    uint8_t buf[2048];
+    int packets = 0;
+    uint32_t firstSeq = 0, lastSeq = 0;
+    const DWORD until = GetTickCount() + 1200;
+    while (GetTickCount() < until) {
+        const int n = recvfrom(c, (char*)buf, (int)sizeof buf, 0, nullptr, nullptr);
+        if (n <= 0) break;
+        const mdxm::vban::Parsed p = mdxm::vban::ParsePacket(buf, (size_t)n);
+        if (!p.valid || p.proto != mdxm::vban::kProtoAudio) continue;
+        if (packets == 0) firstSeq = p.hdr.nuFrame;
+        lastSeq = p.hdr.nuFrame;
+        ++packets;
+        const size_t samples = p.dataLen / 2;
+        for (size_t i = 0; i < samples; ++i) {
+            int16_t s = 0;
+            memcpy(&s, p.data + i * 2, 2);
+            got.push_back((float)s / 32767.0f);
+        }
+    }
+    tone.Stop();
+    const VbanStatus st = srv.Status();
+    srv.Stop();
+    eng.SetVbanSink(false, false);
+    eng.Stop();
+    closesocket(c);
+
+    wprintf(L"vban: %d packets, seq %u..%u, sent=%llu starved=%llu depth=%dms\n",
+            packets, firstSeq, lastSeq, (unsigned long long)st.sent,
+            (unsigned long long)st.starved, st.depthMs);
+    CHECK(packets > 100);                        // ~188/s at 256 frames
+    CHECK(lastSeq - firstSeq == (uint32_t)(packets - 1));   // no gaps on loopback
+    const size_t frames = got.size() / 2;
+    CHECK(frames > 20000);
+    // The tone at 5 % channel level and 400 % stream gain: 0.5 * 0.05 * 4 = 0.1.
+    const double amp = GoertzelAmp(got.data(), frames / 4, frames * 3 / 4, 440.0,
+                                   (double)eng.MixRate());
+    wprintf(L"vban 440 Hz bin = %.4f (expected ~0.10)\n", amp);
+    CHECK(amp > 0.05 && amp < 0.16);
+    // A graph that was feeding the ring properly starves rarely; a handful at
+    // the start, before the cushion filled, is ordinary.
+    CHECK(st.starved < 20);
+}
+
+MDXM_TEST_CASE(Audio_VbanFrameCaptureProducesJpeg) {
+    // Under --audio with the rest, because it needs a GPU and a desktop -- not
+    // because it needs audio. What it checks is the part no headless test can:
+    // that duplication, the mip downscale and the WIC encode together produce
+    // something a decoder would accept, and that the display is identified by its
+    // Windows DEVICE NUMBER rather than by its position in an enumeration.
+    // The WIC encoder is COM, and in the program this runs on the capture thread,
+    // which owns its own apartment. A test calling Init directly has to do the
+    // same or the encoder cannot be created.
+    const HRESULT comInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    DisplayCapture cap;
+    std::wstring err;
+    if (!cap.Init(&err)) {
+        wprintf(L"skip (no desktop duplication: %s)\n", err.c_str());
+        if (SUCCEEDED(comInit)) CoUninitialize();
+        return;
+    }
+    // Duplication only reports CHANGED regions, so a still desktop yields
+    // nothing. Nudging the cursor is enough to dirty a screen.
+    std::vector<CapturedFrame> frames;
+    for (int i = 0; i < 60 && frames.empty(); ++i) {
+        POINT p = {};
+        GetCursorPos(&p);
+        SetCursorPos(p.x + (i % 2 ? 1 : -1), p.y);
+        Sleep(50);
+        frames = cap.Poll(480, 60);
+    }
+    wprintf(L"captured %zu frame(s), %llu output(s) skipped\n", frames.size(),
+            (unsigned long long)cap.SkippedOutputs());
+    if (frames.empty()) {
+        wprintf(L"skip (no display reported a change in 3 s)\n");
+        cap.Shutdown();
+        if (SUCCEEDED(comInit)) CoUninitialize();
+        return;
+    }
+    for (const auto& f : frames) {
+        wprintf(L"  display %d: %zu bytes\n", f.deviceNumber, f.jpeg.size());
+        CHECK(f.deviceNumber >= 1);          // \\.\DISPLAYn, never an index
+        CHECK(f.jpeg.size() > 512);
+        // SOI and EOI: the two markers a decoder looks for first.
+        CHECK(f.jpeg.size() >= 4);
+        CHECK(f.jpeg[0] == 0xFF && f.jpeg[1] == 0xD8);
+        CHECK(f.jpeg[f.jpeg.size() - 2] == 0xFF && f.jpeg[f.jpeg.size() - 1] == 0xD9);
+        // The whole point of the mip downscale: a 4K frame must not come back as
+        // a 33 MB readback dressed up as a thumbnail.
+        CHECK(f.jpeg.size() < 400 * 1024);
+    }
+    CHECK(!cap.Lost());
+    cap.Shutdown();
+    if (SUCCEEDED(comInit)) CoUninitialize();
 }
 
 MDXM_TEST_CASE(Audio_DriftCountersStayNearZero) {

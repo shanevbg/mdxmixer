@@ -138,7 +138,11 @@ if ($Target -eq "Clean") {
     /nologo `
     /clp:Summary
 
-exit $LASTEXITCODE
+# REMEMBERED, NOT EXITED ON. There used to be an `exit $LASTEXITCODE` here,
+# which made every line below it unreachable: -Install was accepted, printed
+# nothing, installed nothing, and still exited 0, so the only symptom was a run
+# location that quietly never changed.
+$buildExit = $LASTEXITCODE
 
 # ── Install: put the build somewhere a rebuild cannot touch ───────────────────
 #
@@ -146,7 +150,11 @@ exit $LASTEXITCODE
 # builds do not have an impact on a running mdxmixer -- which until now they
 # did, every single time, because the only copy was the one in bin\Release that
 # the linker overwrites.
-if ($Install -and $Target -ne "Clean") {
+#
+# Only after a build that SUCCEEDED. Installing the previous binary because
+# this build failed would replace a working copy with something older while
+# reporting the failure, which is the worst of both.
+if ($Install -and $Target -ne "Clean" -and $buildExit -eq 0) {
     if ($Configuration -eq "Test") {
         Write-Host "Nothing to install for the Test configuration."
     } else {
@@ -202,3 +210,7 @@ if ($Install -and $Target -ne "Clean") {
         }
     }
 }
+
+# The BUILD's exit code, whatever the install did. A caller is asking whether
+# the code compiled; a copy that failed has already said so loudly above.
+exit $buildExit

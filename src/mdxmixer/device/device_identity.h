@@ -47,6 +47,97 @@ struct DeviceAlias {
 // The filing flags alone, for a device we may never have been told about.
 struct DeviceView { bool hidden = false; bool pinned = false; };
 
+// ── Does a stored reference still name this endpoint? ────────────────────────
+//
+// A failover allowlist entry stores an id and the Windows name it had when it
+// was added, and BOTH can die. Re-pairing mints a new endpoint id; Windows then
+// bumps the name's prefix, so "Headphones (11- WF-1000XM5)" comes back as
+// "(12- ...)" and a day later as "(14- ...)". Shane's saved list is the proof:
+// 21 entries naming prefixes 2- through 14-, of which the machine still has
+// six.
+//
+// THE FAILURE THIS EXISTS TO STOP is not a missed match -- it is two different
+// rules for one list. The engine's watcher matches an entry by id OR by name
+// (failover_watcher.h), so it failed over correctly onto a headset whose stored
+// id was long dead. The devices tab matched by id, falling back to the name
+// only for an entry that had never had one, so the same row was drawn as
+// "unknown": no battery, no date, raw Windows name -- and counted into a
+// "Remove unknown (20)" button that would have deleted the entries doing the
+// work. One rule, used by both, is the fix.
+//
+// The ladder, strongest first:
+//   * Bluetooth address -- belongs to the HEADSET rather than to the pairing,
+//     so it is the one anchor that survives changing the adapter. Everything
+//     else on this list is minted per pairing or assigned by Windows.
+//   * alias -- OURS, and re-homed onto the current endpoint by DisplayName
+//     through btAddress and container, so it survives a re-pair too.
+//   * endpoint id -- exact while the pairing lasts, worthless after it.
+//   * Windows name -- survives a re-pair that keeps the prefix, which is most
+//     of them, and is all an entry added while its device was switched off has.
+struct DeviceRefKeys {
+    std::wstring id;
+    std::wstring name;        // what WINDOWS calls it
+    // OUR name for it, or EMPTY when it has never been named. Empty is not the
+    // same as "called whatever Windows calls it", and the difference bit:
+    // AliasFor and DisplayName both fall back to the Windows name, so a caller
+    // that passes their result straight in gives an un-named device an "alias"
+    // of "Headphones (12- WF-1000XM5)". Compared against a device that really
+    // is named "Bk2", those two differ, and SameDevice rules out a match it
+    // should have made. Use AliasOrNone below rather than assigning directly.
+    std::wstring alias;
+    std::wstring btAddress;   // the headset's own, lower-case hex; empty off Bluetooth
+};
+
+// An alias that is really just the Windows name is no alias at all.
+//
+// The fallback is right for DISPLAY -- a list has to put something in the
+// column -- and wrong for MATCHING, which is what this exists to keep apart.
+inline std::wstring AliasOrNone(const std::wstring& alias, const std::wstring& windowsName) {
+    return (alias.empty() || alias == windowsName) ? std::wstring() : alias;
+}
+bool SameDevice(const DeviceRefKeys& ref, const DeviceRefKeys& dev);
+
+// Which of these references name a device an earlier one already names.
+//
+// Returns the indices to drop, ascending. Shane's failover list had 21 entries
+// for seven physical headsets, because every re-pairing that was added while
+// the old entry was still there left both behind -- and until SameDevice they
+// did not LOOK like duplicates, since one would resolve to "Rg1" and the other
+// was drawn under whatever Windows was calling it that week.
+//
+// THE EARLIEST OCCURRENCE IS KEPT, and that is not an arbitrary tie-break: the
+// order of an allowlist IS the preference, "first present entry wins", so
+// keeping the later one would silently demote a device the user had put at the
+// top. Nothing is lost by keeping a worse-anchored entry either, because
+// SameDevice matches on the alias, which is re-homed onto whatever endpoint the
+// device is wearing today.
+//
+// Candidates are compared only against entries that are being KEPT. SameDevice
+// is not transitive -- A and B can share an alias while B and C share a name --
+// and chaining through a dropped entry would let one junk row pull unrelated
+// devices together.
+std::vector<size_t> DuplicateRefs(const std::vector<DeviceRefKeys>& refs);
+
+// What a stored reference should become, now that it has been matched to a
+// device that is actually here.
+//
+// A saved entry rots: its endpoint id dies at the next re-pair and the Windows
+// name it recorded dies with the one after that. The cure is not to ask the
+// user to tidy up -- it is to write the better anchors back the moment the
+// entry and the device are in the same room, which is what every sweep is.
+//
+// THE ADDRESS IS THE POINT. An entry that has been through this once carries
+// the headset's own address, and from then on it survives a change of adapter,
+// which is the event that otherwise invalidates every id and every container
+// on the machine at once.
+//
+// Returns true and writes through `ref` when something changed, so a caller can
+// avoid touching the config -- this runs on every sweep and must cost nothing
+// in the ordinary case where the entry is already right.
+//
+// `alias` is deliberately NOT healed: it is the user's, not Windows'.
+bool HealDeviceRef(DeviceRefKeys& ref, const DeviceRefKeys& dev);
+
 // Windows hands every device with no real container the same placeholder GUID,
 // {00000000-0000-0000-FFFF-FFFFFFFFFFFF}. Six SteelSeries Sonar virtual
 // endpoints carrying it are not one physical device: treating it as an anchor

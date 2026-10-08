@@ -139,8 +139,21 @@ bool Engine::StartImpl(const MixerConfig& cfg, std::wstring* err) {
         } else {
             notes += L"no render device available for the personal mix; ";
         }
-        m_baseCushion = m_mixRate * 3 / 100;   // ~30 ms — the spec's latency budget; adapts upward per consumer
+        // ALL THREE, not just the floor. The two adaptive terms are what
+        // actually govern the latency once the floor is out of the way, and
+        // loading only the floor meant a value found by experiment was written
+        // to config, honoured until the next restart, and then silently
+        // replaced by the defaults -- which read as the setting not working.
+        m_cushionMs = cfg.cushionMs;
+        m_cushionHeadroom = cfg.cushionHeadroomPercent;
+        m_cushionFlatMs = cfg.cushionFlatMs;
+        m_baseCushion = m_mixRate * (uint32_t)m_cushionMs / 1000;   // the FLOOR; adapts upward per consumer
         m_maxMixPull = m_maxStreamPull = m_maxMicPull = 0;
+        // Sixty seconds at the mix rate, which is what the cushion now adapts
+        // over instead of over the life of the process (fj#12).
+        m_mixPullWindow.Configure(m_mixRate * kPullWindowSeconds);
+        m_streamPullWindow.Configure(m_mixRate * kPullWindowSeconds);
+        m_micPullWindow.Configure(m_mixRate * kPullWindowSeconds);
 
         // Mix scratch, sized once — no allocation on the audio thread. The
         // render thread is already running at this point; m_graphReady (still
@@ -188,8 +201,11 @@ bool Engine::StartImpl(const MixerConfig& cfg, std::wstring* err) {
             ch->streamingGain.SnapTo(ch->smute ? 0.0f : ch->svol);
             ch->peakHold.Configure(PeakHoldFramesFor(m_mixRate));
             ch->captureScratch.assign(kMaxPullFrames * 2, 0.0f);
-            if (!StartChannelCapture(*ch, eps))
-                notes += ch->id + L": " + ch->healthMsg + L"; ";
+            // NOT started here (fj#10). Whether anything is pulling the mix is
+            // not yet known at this point -- the streaming render is brought up
+            // below -- so the decision is made once, after the whole graph
+            // exists, by MatchCapturesToDemand. Idle until then.
+            ch->idle.store(true);
             m_channels.push_back(std::move(ch));
         }
         // Everything MixPull touches now exists and will not move again.
@@ -204,8 +220,9 @@ bool Engine::StartImpl(const MixerConfig& cfg, std::wstring* err) {
                 try {
                     if (frames > kMaxPullFrames) { memset(out, 0, frames * 2 * sizeof(float)); return; }
                     if (frames > m_maxStreamPull) m_maxStreamPull = frames;
+                    m_streamPullWindow.Push(frames, frames);   // see MixPull (fj#12)
                     if (!m_streamCushionDone.load(std::memory_order_acquire)) {
-                        if (m_streamRing.Depth() < CushionFor(m_maxStreamPull)) { memset(out, 0, frames * 2 * sizeof(float)); return; }
+                        if (m_streamRing.Depth() < CushionFor(m_streamPullWindow.Max())) { memset(out, 0, frames * 2 * sizeof(float)); return; }
                         // Rates are re-derived here, so a mix-rate change only has
                         // to clear the cushion flag for this chain to follow it.
                         m_streamResampler.SetRates((double)m_mixRate.load(), (double)m_streamRender.DeviceRate());
@@ -263,8 +280,9 @@ bool Engine::StartImpl(const MixerConfig& cfg, std::wstring* err) {
                     try {
                         if (frames > kMaxPullFrames) { memset(out, 0, frames * 2 * sizeof(float)); return; }
                         if (frames > m_maxMicPull) m_maxMicPull = frames;
+                        m_micPullWindow.Push(frames, frames);   // see MixPull (fj#12)
                         if (!m_micCushionDone) {
-                            if (m_micRing.Depth() < CushionFor(m_maxMicPull)) { memset(out, 0, frames * 2 * sizeof(float)); return; }
+                            if (m_micRing.Depth() < CushionFor(m_micPullWindow.Max())) { memset(out, 0, frames * 2 * sizeof(float)); return; }
                             m_micCushionDone = true;
                         }
                         size_t real = m_micRing.Read(out, frames);
@@ -293,6 +311,15 @@ bool Engine::StartImpl(const MixerConfig& cfg, std::wstring* err) {
             notes += L"mic input or mic cable endpoint not found; ";
         }
 
+        // The whole graph exists now, so whether anything is pulling the mix
+        // is finally knowable: the personal render was attempted above, the
+        // streaming render is up or not, and the feed's state is known. Start
+        // the captures that are warranted and leave the rest idle (fj#10).
+        MatchCapturesToDemand(eps);
+        for (const auto& ch : m_channels)
+            if (!ch->idle.load() && !ch->healthy.load())
+                notes += ch->id + L": " + ch->healthMsg + L"; ";
+
         if (err) *err = notes;
         return true;   // the app always starts; notes carry the degradations
     } catch (...) {
@@ -309,6 +336,12 @@ bool Engine::StartChannelCapture(ChannelRuntime& ch, const std::vector<EndpointI
         return false;
     }
     ch.ready.store(false, std::memory_order_release);
+    // Capacity from the mix rate: 500 ms, which is the worst latency a stall
+    // can leave behind (fj#13). Safe here -- the capture is stopped and
+    // `ready` is false, so nothing is touching the ring.
+    ch.ring.Resize((size_t)m_mixRate.load() * kRingMs / 1000);
+    ch.speedTrim.store(1.0, std::memory_order_relaxed);
+    ch.appliedSpeed = 1.0;
     std::wstring cerr;
     ChannelRuntime* chp = &ch;
     // A render endpoint bound as a channel source is tapped via WASAPI loopback —
@@ -317,6 +350,16 @@ bool Engine::StartChannelCapture(ChannelRuntime& ch, const std::vector<EndpointI
     bool ok = ch.capture.Start(ep->id, ep->isRender, [this, chp](const float* f, size_t n) {
         try {
             if (!chp->ready.load(std::memory_order_acquire)) return;
+            // The drain, applied here because the resampler belongs to this
+            // thread (fj#13). Only when it CHANGES: SetSpeed is cheap and
+            // allocation-free, but there is no reason to recompute a ratio per
+            // block, and comparing against the last applied value keeps the
+            // common case -- a speed of exactly 1.0, for ever -- free.
+            const double want = chp->speedTrim.load(std::memory_order_relaxed);
+            if (want != chp->appliedSpeed) {
+                chp->resampler.SetSpeed(want);
+                chp->appliedSpeed = want;
+            }
             if (chp->resampler.IsPassthrough()) { chp->ring.Write(f, n); return; }
             size_t maxOut = chp->resampler.EstimateOut(n);
             if (maxOut * 2 > chp->captureScratch.size()) return;
@@ -345,7 +388,14 @@ void Engine::MixPull(float* out, size_t frames) {
             memset(out, 0, frames * 2 * sizeof(float));   // graph being built or torn down
             return;
         }
-        if (frames > m_maxMixPull) m_maxMixPull = frames;
+        // The cushion is sized from the largest pull in the LAST MINUTE, not
+        // the largest ever seen (fj#12). A high-water mark that only rose meant
+        // one Bluetooth hiccup raised the latency for the rest of the session
+        // and it never came back down. The window's tick is frames, because the
+        // audio thread must not call a clock, and the mix advances by exactly
+        // the frames it pulls.
+        m_mixPullWindow.Push(frames, frames);
+        if (frames > m_maxMixPull) m_maxMixPull = frames;   // all-time, for MDXM_DIAG only
         // Proof of life for the peak meters, before anything can return early
         // for a reason that is not "the mix stopped".
         m_mixFrames.fetch_add(frames, std::memory_order_relaxed);
@@ -360,16 +410,18 @@ void Engine::MixPull(float* out, size_t frames) {
                 // are genuinely quiet.
                 ch.peakHold.MarkUnknown();
                 ch.peakPub.store(kPeakUnknown, std::memory_order_relaxed);
+                ch.peakNowPub.store(kPeakUnknown, std::memory_order_relaxed);
                 continue;
             }
             if (!ch.cushionDone) {
-                if (ch.ring.Depth() < CushionFor(m_maxMixPull)) {
+                if (ch.ring.Depth() < CushionFor(m_mixPullWindow.Max())) {
                     // Healthy, and deliberately silent while the cushion fills.
                     // Pushed as a real zero rather than skipped, so a held peak
                     // from before a dropout expires on schedule instead of
                     // being frozen by the gap that follows it.
                     ch.peakHold.Push(0.0f, frames);
                     ch.peakPub.store(ch.peakHold.Value(), std::memory_order_relaxed);
+                    ch.peakNowPub.store(0.0f, std::memory_order_relaxed);
                     continue;                                      // silent until the cushion fills
                 }
                 ch.cushionDone = true;
@@ -381,8 +433,10 @@ void Engine::MixPull(float* out, size_t frames) {
             // ChannelState::peak -- one source and two gains means a post-fader
             // peak would have to be two numbers, and "which of these is making
             // sound" stays true of a channel muted on one side.
-            ch.peakHold.Push(BlockPeak(m_chanBuf.data(), frames), frames);
+            const float blockPeak = BlockPeak(m_chanBuf.data(), frames);
+            ch.peakHold.Push(blockPeak, frames);
             ch.peakPub.store(ch.peakHold.Value(), std::memory_order_relaxed);
+            ch.peakNowPub.store(blockPeak, std::memory_order_relaxed);
             memcpy(m_pBuf.data(), m_chanBuf.data(), frames * 2 * sizeof(float));
             memcpy(m_sBuf.data(), m_chanBuf.data(), frames * 2 * sizeof(float));
             ch.personalGain.Process(m_pBuf.data(), frames);
@@ -405,6 +459,17 @@ void Engine::MixPull(float* out, size_t frames) {
         // One relaxed atomic load per block when the feed is off, which is
         // the normal case, and no copy at all.
         if (m_feedOn.load(std::memory_order_relaxed)) m_feed.Write(m_sSum.data(), frames);
+        // The VBAN sink (spec §3.1). The PERSONAL sum by default -- the whole
+        // point of the feature is to hear what the headphones are hearing,
+        // per-channel balance and personal mutes included -- or the streaming
+        // sum when configured, which is the programme mix and a different thing.
+        //
+        // The write is all that happens on this thread: makeup gain, the
+        // limiter, the int16 conversion and the socket are the sender thread's
+        // work. One relaxed load per block when the sink is off, and no copy.
+        if (m_vbanOn.load(std::memory_order_relaxed))
+            m_vbanRing.Write(m_vbanStreamingSrc.load(std::memory_order_relaxed)
+                                 ? m_sSum.data() : m_pSum.data(), frames);
     } catch (...) {
         memset(out, 0, frames * 2 * sizeof(float));   // no-crash rule
     }
@@ -429,8 +494,14 @@ bool Engine::StartPersonalRender(const std::wstring& endpointId) {
 void Engine::ReconfigureForMixRate() {
     m_graphReady.store(false, std::memory_order_release);   // MixPull renders silence meanwhile
     const uint32_t rate = m_mixRate.load();
-    m_baseCushion = rate * 3 / 100;
+    m_baseCushion = rate * (uint32_t)m_cushionMs / 1000;
     m_maxMixPull = m_maxStreamPull = 0;
+    // The windows are measured in FRAMES, so a rate change rescales them --
+    // and clears them, which is right: pull sizes recorded at the old rate
+    // describe a different device.
+    m_mixPullWindow.Configure(rate * kPullWindowSeconds);
+    m_streamPullWindow.Configure(rate * kPullWindowSeconds);
+    m_micPullWindow.Configure(rate * kPullWindowSeconds);
     auto eps = EnumerateEndpoints();
     for (auto& chp : m_channels) {
         ChannelRuntime& ch = *chp;
@@ -449,6 +520,10 @@ void Engine::ReconfigureForMixRate() {
     }
     // The stream thread re-derives its own resampler on the next cushion rebuild.
     m_streamRing.Clear();
+    // Audio captured at the old rate would be played at the new one: a backlog
+    // that is also the wrong speed. The sender re-derives its SR index from the
+    // live rate, so the only thing to undo here is the content.
+    m_vbanRing.Clear();
     m_streamCushionDone.store(false, std::memory_order_release);
     m_graphReady.store(true, std::memory_order_release);
 }
@@ -575,7 +650,86 @@ void Engine::EnsurePersonalRender(const std::vector<EndpointInfo>& eps) {
     if (want.empty()) { if (renderDead) m_personalRender.Stop(); return; }
     if (!renderDead && want == m_currentPersonalId) return;
     m_personalRender.Stop();
-    StartPersonalRender(want);
+    const bool started = StartPersonalRender(want);
+    // THE DEVICE RECONNECTED, so start the rings from zero rather than draining
+    // them (fj#13). Shane's rule: "the ring should restart from zero if the
+    // device reconnects as there was already a drop of some ms". Whatever
+    // accumulated while the render was away is stale by definition, and the
+    // listener has just heard an interruption anyway -- so there is nothing to
+    // protect by easing it out at 5% over the next ten seconds.
+    if (started) {
+        for (auto& ch : m_channels) {
+            if (ch->idle.load()) continue;
+            ch->ring.Clear();
+            ch->cushionDone = false;
+            ch->speedTrim.store(1.0, std::memory_order_relaxed);
+        }
+    }
+}
+
+// ── Who is pulling the mix, and what that means for capture (fj#10) ──────
+//
+// Control thread, m_mutex held.
+MixDemand Engine::CurrentDemand() const {
+    MixDemand d;
+    // A render that exists and is not dead. m_currentPersonalId alone is not
+    // enough: it survives a stream that has stalled or been invalidated, and a
+    // stalled render pulls nothing.
+    d.personalRender = !m_currentPersonalId.empty() && !m_personalRender.Dead();
+    d.streamingRender = m_streamEnabled;
+    d.feed = m_feedOn.load(std::memory_order_relaxed);
+    // Reported, never counted: AnyoneListening ignores it on purpose, because
+    // this sink has no clock of its own (mix_demand.h).
+    d.vban = m_vbanOn.load(std::memory_order_relaxed);
+    return d;
+}
+
+// Start or stop the channel captures to match demand.
+//
+// WHY THIS EXISTS. A capture used to run from engine start to engine stop,
+// whatever was or was not pulling the mix. With no personal render device --
+// which is an ordinary thing after a failed start or an unplugged headset --
+// every channel went on waking per WASAPI buffer, copying into a ring, and
+// discarding all of it: measured at 41.4 million dropped frames over fourteen
+// minutes, the ring pinned at full depth, underruns at zero because the mix
+// thread never ran at all.
+//
+// The rule was already in this program for the shared-memory feed, which stays
+// off until a client asks and whose comment gives the reason -- "a mapping
+// nobody reads and a copy per audio block for nothing". It simply had never
+// been applied to capture. Shane's framing: "mdxmixer is only publishing audio
+// on demand -- if there is no demand for it to publish (and there wasn't) it
+// shouldn't run the ring."
+//
+// STOPPING ALSO FIXES THE STALENESS. A ring left full while nobody listened
+// handed the next consumer two seconds of audio recorded in the meantime, and
+// because producer and consumer run at the same rate that backlog never
+// cleared. StartChannelCapture clears the ring, so a capture that idles comes
+// back in sync.
+//
+// IDLE IS NOT BROKEN. `healthy` is left exactly as it was, and `idle` says why
+// there is no stream; a machine with nothing listening must not read as a
+// machine with a fault.
+void Engine::MatchCapturesToDemand(const std::vector<EndpointInfo>& eps) {
+    const bool wanted = AnyoneListening(CurrentDemand());
+    for (auto& ch : m_channels) {
+        if (wanted && ch->idle.load()) {
+            ch->idle.store(false);
+            // A capture that cannot start says so through `healthy`, exactly
+            // as it does on any other start path.
+            StartChannelCapture(*ch, eps);
+            Log(2, L"%s: capture started -- something is listening again", ch->id.c_str());
+        } else if (!wanted && !ch->idle.load()) {
+            // Order matters: stop the callback writing before marking idle, so
+            // nothing is still arriving when the ring is declared empty.
+            ch->ready.store(false, std::memory_order_release);
+            ch->capture.Stop();
+            ch->ring.Clear();
+            ch->peakPub.store(kPeakUnknown, std::memory_order_relaxed);
+            ch->idle.store(true);
+            Log(2, L"%s: capture stopped -- nothing is pulling the mix", ch->id.c_str());
+        }
+    }
 }
 
 // Is the mix actually being pulled? Control thread, ~1 s.
@@ -682,11 +836,17 @@ void Engine::OnDeviceSetChangedImpl() {
     try {
         std::lock_guard<std::mutex> lock(m_mutex);
         auto eps = EnumerateEndpoints();
-        for (auto& ch : m_channels)
+        for (auto& ch : m_channels) {
+            // An idle channel has no stream to be invalid and nothing to
+            // repair; whether it should be running at all is decided by
+            // demand, below (fj#10).
+            if (ch->idle.load()) continue;
             if (!ch->healthy.load() || ch->capture.Invalidated()) {
                 ch->capture.Stop();
                 StartChannelCapture(*ch, eps);
             }
+        }
+        MatchCapturesToDemand(eps);
     } catch (...) {
         Log(1, L"device-change sweep: unknown exception");
     }
@@ -727,6 +887,23 @@ bool Engine::SetFeedEnabled(bool on, std::wstring* err) {
     return true;
 }
 
+void Engine::SetVbanSink(bool on, bool streamingSource) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    // The source is stored whether or not the on/off state is changing: a live
+    // switch between the personal and streaming sums is a legitimate thing to
+    // do while the stream is running, and it takes effect on the next block.
+    m_vbanStreamingSrc.store(streamingSource, std::memory_order_relaxed);
+    if (on == m_vbanOn.load(std::memory_order_relaxed)) return;
+    // Cleared BEFORE the flag goes up, so the first thing the sender drains is
+    // audio from after the subscription rather than whatever was in flight when
+    // the last listener left. There is no symmetric wait on the way down (the
+    // feed needs one because it unmaps a view; this ring outlives the engine).
+    if (on) m_vbanRing.Clear();
+    m_vbanOn.store(on, std::memory_order_relaxed);
+    Log(2, L"vban sink: %s (%s mix)", on ? L"on" : L"off",
+        streamingSource ? L"streaming" : L"personal");
+}
+
 void Engine::TickFailover() {
     // What the app layer must be told once the lock is released. Calling back
     // into app code while holding m_mutex is a same-thread relock the moment
@@ -739,15 +916,54 @@ void Engine::TickFailover() {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_epSnapshot = EnumerateEndpoints();
 
+        // ── AUDIODG, the cause rather than the symptom (fj#2 §4) ─────────
+        //
+        // Ported from MDropDX12's MixerAudioEngineTick (#410). The endpoint
+        // test below sees the audio graph rebuilding only when it takes every
+        // endpoint down with it; AUDIODG restarting while the endpoints stay
+        // listed is the same hazard and is invisible to it. The process id is
+        // the signal -- a restart always gets a new one -- and it is read
+        // BEFORE the decision, so the hold is in place on the same tick.
+        //
+        // The hold length is a CEILING, not a duration: killed cleanly AUDIODG
+        // is back in under a second, and about a minute after Sonar's APO
+        // faults it. Both measured. So it is released as soon as the engine
+        // has been back and unchanged for a moment rather than served out.
+        if (m_audiodg.ShouldScan((unsigned)GetTickCount64())) {
+            const unsigned now = (unsigned)GetTickCount64();
+            switch (m_audiodg.Observe(FindAudiodgPid(), now)) {
+            case AudiodgEvent::Restarted:
+                m_failover.HoldFor(60000);
+                Log(1, L"Windows audio engine (AUDIODG.EXE) restarted (#%u, now pid %lu); "
+                       L"holding failover up to 60s",
+                    m_audiodg.Restarts(), (unsigned long)m_audiodg.Pid());
+                break;
+            case AudiodgEvent::SteadyAgain:
+                if (m_failover.HoldRemainingMs() > 0) {
+                    m_failover.ReleaseHold();
+                    Log(2, L"Windows audio engine is back and steady; resuming failover");
+                }
+                break;
+            case AudiodgEvent::Appeared:
+                if (m_audiodg.Restarts() > 0)
+                    Log(2, L"Windows audio engine is back (pid %lu)",
+                        (unsigned long)m_audiodg.Pid());
+                break;
+            case AudiodgEvent::Nothing:
+                break;
+            }
+        }
+
         // The whole device set reading absent at once is the audio graph being
         // rebuilt, not every device being unplugged in the same tick. Acting
         // on that snapshot moves the route at the one moment no move can
         // succeed, and adds churn to a graph that is already rebuilding
         // (MDropDX12 #410). Hold, and let it lift when the devices come back.
         //
-        // The hold is a CEILING. mdx12 drives this from an AUDIODG process
-        // watch and releases as soon as the engine is back and steady; the
-        // same release happens here the first tick that sees a device again.
+        // Kept ALONGSIDE the AUDIODG watch above rather than replaced by it:
+        // this one catches an audio graph that has taken the endpoints down
+        // without AUDIODG changing pid, and the watch catches a restart that
+        // leaves the endpoints listed. Neither sees the other's case.
         bool anyRender = false;
         for (const auto& e : m_epSnapshot)
             if (e.isRender && e.isActive) { anyRender = true; break; }
@@ -781,6 +997,78 @@ void Engine::TickFailover() {
             EnsurePersonalRender(m_epSnapshot);
         } else if (m_personalRender.Dead()) {
             EnsurePersonalRender(m_epSnapshot);
+        }
+
+        // WANTED AND NOT RUNNING (fj#11). The three branches above are all
+        // about a stream that EXISTED -- the device went away, it came back,
+        // the stream died. A render that never STARTED is none of them:
+        // `boundPresent` is true because the device is right there, no
+        // fallback is in force, and Dead() reads false because there is no
+        // impl to be dead. So one failed start used to mean silence until
+        // something else happened to shake the engine, which on 2026-10-04
+        // meant fourteen minutes of it.
+        //
+        // Backed off, because the reason a device will not open is usually not
+        // going to change in the next second -- it is being installed, or held
+        // exclusively, or mid-handshake. See RenderRetry.
+        if (m_currentPersonalId.empty()) {
+            const unsigned now = (unsigned)GetTickCount64();
+            if (m_renderRetry.Due(now)) {
+                const std::wstring want =
+                    PickPersonalOutput(m_epSnapshot, m_boundPersonal,
+                                       DefaultRenderEndpointId(), CaptureSources());
+                if (want.empty()) {
+                    // Nothing to render to at all. Not a failure to back off
+                    // from -- failover below is the thing that fixes it -- so
+                    // the counter is cleared and the next real candidate gets
+                    // an immediate attempt.
+                    m_renderRetry.Reset();
+                } else if (StartPersonalRender(want)) {
+                    m_renderRetry.Reset();
+                    Log(2, L"personal render started on retry");
+                } else {
+                    m_renderRetry.Failed(now);
+                    Log(1, L"personal render still will not start (attempt %u); "
+                           L"next try in %u s",
+                        m_renderRetry.Attempts(), m_renderRetry.IntervalMs() / 1000);
+                }
+            }
+        } else {
+            m_renderRetry.Reset();
+        }
+
+        // Captures follow demand, every tick (fj#10). Placed after the render
+        // work on purpose: a render that has just come up is a consumer, and
+        // its channels should start in the same tick rather than a second
+        // later with the mix pulling from empty rings.
+        MatchCapturesToDemand(m_epSnapshot);
+
+        // And the varispeed trim that holds each ring at its cushion (fj#13).
+        // Computed here rather than on the audio thread because the depth moves
+        // slowly and the decision is arithmetic over three numbers; the capture
+        // thread only applies it.
+        //
+        // BOTH DIRECTIONS. Draining a backlog was the first half. A ring
+        // running SHORT needs the producer to run slightly ahead instead, and
+        // without that half a clock drifting the other way underruns for ever
+        // -- which is exactly what ten underruns on 2026-10-05 were, with the
+        // trim sitting at 1.0 throughout because it only knew how to speed up.
+        {
+            const size_t target = CushionFor(m_mixPullWindow.Max());
+            for (auto& ch : m_channels) {
+                if (ch->idle.load()) continue;
+                const size_t depth = ch->ring.Depth();
+                const double speed = RingSpeed(depth, target, ch->ring.Capacity());
+                const double was = ch->speedTrim.exchange(speed, std::memory_order_relaxed);
+                // Logged only on the way in and out of a correction, not for
+                // every adjustment: this runs every second for ever.
+                if (was == 1.0 && speed != 1.0)
+                    Log(2, L"%s: %s at %.2f%% (%zu frames against a %zu cushion)",
+                        ch->id.c_str(), speed > 1.0 ? L"draining" : L"refilling",
+                        (speed - 1.0) * 100.0, depth, target);
+                else if (was != 1.0 && speed == 1.0)
+                    Log(2, L"%s: back to normal speed", ch->id.c_str());
+            }
         }
 
         // The rule, re-sent each tick so a config edit takes effect without a
@@ -843,10 +1131,18 @@ void Engine::SetFailoverCommitCallback(std::function<void(const DeviceRef&)> cb)
 std::vector<ChannelState> Engine::GetChannelStates() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     std::vector<ChannelState> out;
-    for (const auto& c : m_channels)
-        out.push_back({ c->id, c->name, c->healthy.load(),
+    for (const auto& c : m_channels) {
+        ChannelState s{ c->id, c->name, c->healthy.load(),
                         c->pvol, c->pmute, c->svol, c->smute, c->eqEnabled,
-                        c->peakPub.load(std::memory_order_relaxed) });
+                        c->peakPub.load(std::memory_order_relaxed) };
+        s.idle = c->idle.load();
+        s.peakNow = c->peakNowPub.load(std::memory_order_relaxed);
+        // An idle channel's cable has not been opened, so nothing is KNOWN to
+        // be wrong with it -- and "bad" is a claim about a fault. It reports
+        // ok, with `idle` carrying the reason there is no stream (fj#10).
+        if (s.idle) s.healthy = true;
+        out.push_back(std::move(s));
+    }
     return out;
 }
 
@@ -854,15 +1150,104 @@ DiagState Engine::GetDiag() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     DiagState d;
     for (const auto& c : m_channels)
-        d.rings.push_back({ c->id, c->ring.Depth(), c->ring.Drops(), c->ring.Underruns() });
+        d.rings.push_back({ c->id, c->ring.Depth(), c->ring.Drops(), c->ring.Underruns(),
+                            c->ring.Capacity(),
+                            c->speedTrim.load(std::memory_order_relaxed) });
+    // The stream and mic rings report a speed of 1.0 and mean it: only channel
+    // captures carry a varispeed trim. Their producers are this process's own
+    // threads rather than a second hardware clock, so there is no drift
+    // between the ends for a controller to correct.
     if (m_streamEnabled)
-        d.rings.push_back({ L"stream", m_streamRing.Depth(), m_streamRing.Drops(), m_streamRing.Underruns() });
+        d.rings.push_back({ L"stream", m_streamRing.Depth(), m_streamRing.Drops(),
+                            m_streamRing.Underruns(), m_streamRing.Capacity() });
     if (m_micEnabled)
-        d.rings.push_back({ L"mic", m_micRing.Depth(), m_micRing.Drops(), m_micRing.Underruns() });
+        d.rings.push_back({ L"mic", m_micRing.Depth(), m_micRing.Drops(),
+                            m_micRing.Underruns(), m_micRing.Capacity() });
     d.personalDevice = m_currentPersonalId;
     d.personalFallback = m_personalFallback.load();
     d.maxMixPull = m_maxMixPull;
+    d.windowPull = m_mixPullWindow.Max();
+    d.cushionFrames = CushionFor(d.windowPull);
+    d.mixRate = m_mixRate.load();
     return d;
+}
+
+// The cushion floor, live (fj#12).
+//
+// RE-CUSHIONS EVERY CHANNEL, which is the only way the change can mean
+// anything. The cushion is the depth the mix waits for before it starts
+// draining; once a channel is running, its ring sits at roughly whatever it
+// filled to, and producer and consumer then move at the same rate. Lowering
+// the number without re-cushioning would change what a FUTURE start does and
+// leave today's latency exactly where it was.
+//
+// The cost is a gap of the new cushion's length -- tens of milliseconds -- in
+// each channel while it refills. That is the honest price of changing the
+// latency of a running graph, and it is why this is a deliberate command
+// rather than something applied on a timer.
+bool Engine::SetCushion(int ms, int headroomPercent, int flatMs) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (ms >= 0) {
+        if (ms < 5) ms = 5;
+        if (ms > 200) ms = 200;
+        m_cushionMs = ms;
+    }
+    if (headroomPercent >= 0)
+        m_cushionHeadroom = headroomPercent > 400 ? 400 : headroomPercent;
+    if (flatMs >= 0)
+        m_cushionFlatMs = flatMs > 100 ? 100 : flatMs;
+    m_baseCushion = m_mixRate.load() * (uint32_t)m_cushionMs / 1000;
+    for (auto& ch : m_channels) {
+        if (ch->idle.load()) continue;
+        ch->ring.Clear();
+        ch->cushionDone = false;
+    }
+    m_streamCushionDone = false;
+    m_micCushionDone = false;
+    Log(2, L"cushion: floor %d ms, headroom %d%%, flat %d ms -> %u frames now",
+        m_cushionMs, m_cushionHeadroom, m_cushionFlatMs,
+        (unsigned)CushionFor(m_mixPullWindow.Max()));
+    return true;
+}
+
+int Engine::CushionMs() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_cushionMs;
+}
+
+int Engine::CushionHeadroomPercent() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_cushionHeadroom;
+}
+
+int Engine::CushionFlatMs() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_cushionFlatMs;
+}
+
+// Everything the watcher already knew and nothing outside this process could
+// read (fj#2 §3). Under m_mutex, like GetDiag: the watcher's state is written
+// by TickFailover on the control thread, and this can be asked from a pipe
+// request marshaled onto a different one.
+FailoverStatus Engine::GetFailoverStatus() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    FailoverStatus s;
+    s.routeId = kPersonalRoute;
+    switch (m_failover.StateOf(kPersonalRoute)) {
+    case FailoverState::Searching: s.state = L"searching"; break;
+    case FailoverState::Arming:    s.state = L"arming";    break;
+    default:                       s.state = L"idle";      break;
+    }
+    s.reason         = m_failover.ReasonOf(kPersonalRoute);
+    s.current        = m_failover.CurrentOf(kPersonalRoute);
+    s.target         = m_failover.TargetOf(kPersonalRoute);
+    s.attempts       = m_failover.AttemptsOf(kPersonalRoute);
+    s.dwellMs        = m_failover.DwellMsOf(kPersonalRoute);
+    s.sinceCommitMs  = m_failover.SinceCommitMs(kPersonalRoute);
+    s.holdMs         = m_failover.HoldRemainingMs();
+    s.audiodgPid     = m_audiodg.Pid();
+    s.audiodgRestarts = m_audiodg.Restarts();
+    return s;
 }
 
 } // namespace mdxm
